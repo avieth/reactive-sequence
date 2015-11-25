@@ -135,7 +135,7 @@ switchEB :: Behavior (Event t) -> Event t
 ```
 
 That last one, `switchEB`, does not exist as far as I know. Intuitively, it
-should means that we always have an `Event t`, but it vary over time, and
+should mean that we always have an `Event t`, but it varies over time, and
 whenever it changes, the resulting `Event t` should ignore the previous
 one and only fire when the latest one fires. Maybe this can be done using
 the `reactive-banana` combinators, but regardless, it can also be done using
