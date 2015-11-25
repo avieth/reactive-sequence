@@ -82,3 +82,70 @@ for the first time to deliver its value. Unfortunately, since the types change,
 we can't call this an `Applicative`, so instead we just give `<%>` in place
 of `<*>`.
 
+## `Sequence` is like an `Alternative`
+
+The function `unionWith :: (a -> a -> a) -> Event a -> Event a -> Event a`
+allows us to derive an `Event` which fires whenever either of two `Event`s
+fires, with the most recent value, subject to a disambiguating function in
+case of simultaneous occurrences. The event `never :: Event t` serves as an
+identity under `unionWith`. This resembles an `Alternative`. In fact, if
+we have an `Event` of some semigroup, and if `Event` were an `Applicative`,
+we could make an `Alternative`:
+
+```Haskell
+-- Event would have to always contain a semigroup.
+instance Alternative Event where
+    empty = never
+    <|> = unionWith (<>)
+```
+
+We have some `Alternative`-like infrastructure for `Sequence` as well, and just
+as for its `Applicative`-like functions, it works to combine `Sequences` of
+different parameters. The players are:
+
+```Haskell
+-- A Sequence containing no information. It holds () and never fires.
+nothing :: Sequence (Const ()) (Const Void) t
+
+-- Union two sequences, firing whenever either of them fires, and using their
+-- Semigroup instance to disambiguate simultaneous occurrences.
+--
+-- Actually, there are more constraints, and f3 and g3 are determined by
+-- f1, f2, g1, and g2.
+(<||>) :: Semigroup s => Sequence f1 g2 s -> Sequence f2 g2 s -> Sequence f3 g3 s
+```
+
+The interaction of `<||>` with the type parameters is dual to that of `<%>`.
+Whereas `<%>` will give an `SEvent` if either of its parameters are `SEvent`,
+`<||>` will give an `SBehavior` if either of its parameters are `SBehavior`.
+That's because `<||>` needs only one initial value to give its own initial
+value, whereas `<%>` would require both: the function, and the point at which
+to evaluate it.
+
+## `Sequence` can be switched
+
+It's often useful to dynamically switch events via
+
+```Haskell
+switchE :: Event (Event t) -> Event t`
+switchB :: Behavior a -> Event (Behavior a) -> Behavior a 
+
+-- But what about something like this?
+switchEB :: Behavior (Event t) -> Event t
+```
+
+That last one, `switchEB`, does not exist as far as I know. Intuitively, it
+should means that we always have an `Event t`, but it vary over time, and
+whenever it changes, the resulting `Event t` should ignore the previous
+one and only fire when the latest one fires. Maybe this can be done using
+the `reactive-banana` combinators, but regardless, it can also be done using
+`Sequence`.
+
+```Haskell
+-- The type actually has constraints, and f3 and g3 are determined by
+-- f1, f2, g1, and g2.
+switch :: (t -> t -> t) -> Sequence f1 g1 (Sequence f2 g2 s) -> Sequence f3 g3 s
+```
+
+Sepcializing to `SBehavior (SEvent t)`, we find that switching this gives
+an `SEvent t`, which is in analogy to `switchEB`.
