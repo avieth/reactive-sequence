@@ -42,12 +42,19 @@ module Reactive.Sequence (
     , sequenceFirst
     , sequenceRest
     , bundle
+    , bundleLeft
+    , bundleRight
+    , (<%)
+    , (%>)
+    , fixSBehavior
+    , fixSBehavior'
     , Bundleable
     , bundle'
     , (<%>)
     , (<⌚>)
     , sequenceUnion
     , Unionable
+    , UnionsTo
     , sequenceUnion'
     , (<||>)
     , sequenceCommute
@@ -56,6 +63,7 @@ module Reactive.Sequence (
     , sequenceSwitch'
     , switchSequence
     , Switchable
+    , SwitchesTo
     , switchSequence'
     , switch
     , sequenceReactimate
@@ -238,6 +246,70 @@ bundle transF1 transF2 transG1 transG2 transF1H transF2H transG1H transG2H outH 
                return (filterJust (pick <$> evLR'))
 
        return ((,) <$> transF1 firstl <*> transF2 firstr, theRest)
+
+-- | Bundle with a regular Behavior. The resulting SEvent fires
+bundleLeft
+    :: forall f g s t .
+       ( Applicative f, Applicative g )
+    => (forall a . f (MomentIO a) -> MomentIO (f a))
+    -> Behavior s
+    -> Sequence f g t
+    -> Sequence f g (s, t)
+bundleLeft commuteF behavior sequence = Sequence content id
+  where
+    content :: MomentIO (f (s, t), MomentIO (Event (g (s, t))))
+    content = do
+        ft :: f t <- sequenceFirst sequence
+        let makeFirst :: t -> MomentIO (s, t)
+            makeFirst t = do
+                s <- valueB behavior
+                return (s, t)
+        first :: f (s, t) <- commuteF (makeFirst <$> ft)
+        let theRest :: MomentIO (Event (g (s, t)))
+            theRest = (\ev -> (fmap . (,)) <$> behavior <@> ev) <$> (sequenceRest sequence)
+        pure (first, theRest)
+
+bundleRight
+    :: forall f g s t .
+       ( Applicative f, Applicative g )
+    => (forall a . f (MomentIO a) -> MomentIO (f a))
+    -> Sequence f g t
+    -> Behavior s
+    -> Sequence f g (t, s)
+bundleRight commuteF left right = swap <$> bundleLeft commuteF right left
+  where
+    swap (x, y) = (y, x)
+
+infixl 4 <%
+(<%)
+    :: Behavior (s -> t)
+    -> SEvent s
+    -> SEvent t
+(<%) left right = (uncurry ($)) <$> (bundleLeft (const (pure (Const ()))) left right)
+
+infixl 4 %>
+(%>)
+    :: SEvent (s -> t)
+    -> Behavior s
+    -> SEvent t
+(%>) left right = (uncurry ($)) <$> (bundleRight (const (pure (Const ()))) left right)
+
+-- | Define an SBehavior in terms of its own Behavior
+fixSBehavior :: forall t . (Behavior t -> SBehavior t) -> MomentIO (SBehavior t)
+fixSBehavior makeIt = mdo
+    let sequence = makeIt be
+    be <- sBehaviorToBehavior sequence
+    return sequence
+
+fixSBehavior' :: forall t . (Behavior t -> SBehavior t) -> SBehavior t
+fixSBehavior' makeIt = Sequence content id
+  where
+    content :: MomentIO (Identity t, MomentIO (Event (Identity t)))
+    content = mdo
+        let sequence = makeIt bs
+        bs <- sBehaviorToBehavior sequence
+        first <- sequenceFirst sequence
+        return (first, sequenceRest sequence)
 
 class Bundleable (f1 :: * -> *) (f2 :: * -> *) (g1 :: * -> *) (g2 :: * -> *) where
     type BundleableOutputF f1 f2 g1 g2 :: * -> *
@@ -434,7 +506,15 @@ sequenceUnion disambiguator disambiguatorF disambiguatorG transG1 transG2 left r
                 return (unionWith (disambiguatorG disambiguator) (transG1 <$> restl) (transG2 <$> restr))
         return (disambiguatorF disambiguator firstl firstr, theRest)
 
-class Unionable f1 f2 g1 g2 where
+class
+    ( Applicative f1
+    , Applicative f2
+    , Applicative g1
+    , Applicative g2
+    , Applicative (UnionOutputF f1 f2 g1 g2)
+    , Applicative (UnionOutputG f1 f2 g1 g2)
+    ) => Unionable f1 f2 g1 g2
+  where
     type UnionOutputF f1 f2 g1 g2 :: * -> *
     type UnionOutputG f1 f2 g1 g2 :: * -> *
     unionDisambiguatorF
@@ -487,6 +567,10 @@ instance Unionable (Const ()) (Const ()) Identity Identity where
     unionDisambiguatorG _ f l r = f <$> l <*> r
     unionTransG1 _ = id
     unionTransG2 _ = id
+
+type family UnionsTo s1 s2 :: * -> * where
+    UnionsTo (Sequence f1 g1) (Sequence f2 g2) = Sequence (UnionOutputF f1 f2 g1 g2)
+                                                          (UnionOutputG f1 f2 g1 g2)
 
 -- | Like @sequenceUnion@, but with some parameters filled in automatically
 --   via @Unionable@.
@@ -765,6 +849,11 @@ instance Switchable Identity Identity Identity Identity where
     switchableJoinEventFG _ = fmap runIdentity
     switchableJoinEventG _ = runIdentity
     switchableDisambiguator _ disambiguator l r = disambiguator <$> l <*> r
+
+type family SwitchesTo s1 :: * where
+    SwitchesTo (Sequence f1 g1 (Sequence f2 g2 s)) = Sequence (SwitchableOutputF f1 f2 g1 g2)
+                                                              (SwitchableOutputG f1 f2 g1 g2)
+                                                              s
 
 switchSequence'
     :: forall f1 f2 g1 g2 t .
