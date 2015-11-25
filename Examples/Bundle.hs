@@ -23,12 +23,12 @@ main = do
 
     let networkDescription = do
 
-            -- Every 1/3 of a second, fire event 1
-            (ev1, kill1) <- timedEvent (round ((1/3) * 1000000)) (pure "1/3")
-            -- Every 1/2 of a second, fire event 2
-            (ev2, kill2) <- timedEvent (round ((1/2) * 1000000)) (pure "1/2")
-            -- Every 3 seconds, fire event 3
-            (ev3, kill3) <- timedEvent (round (3 * 1000000)) (pure "3")
+            -- Every 1/2 second, fire event 1
+            (ev1, kill1) <- timedEvent (round ((1/2) * 1000000)) (pure "HALF")
+            -- Every second, fire event 2
+            (ev2, kill2) <- timedEvent (round (1 * 1000000)) (pure "WHOLE")
+            -- Every 2 seconds, fire event 3
+            (ev3, kill3) <- timedEvent (round (2 * 1000000)) (pure "DOUBLE")
 
             -- We bundle those events, to obtain a new event with the latest
             -- values from all 3 events. It will fire whenever any of them
