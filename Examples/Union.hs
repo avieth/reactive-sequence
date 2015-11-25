@@ -1,6 +1,6 @@
 {-|
-Module      : Examples.Bundle
-Description : Example of sequence bundling.
+Module      : Examples.Union
+Description : Example of sequence unioning.
 Copyright   : (c) Alexander Vieth, 2015
 Licence     : BSD3
 Maintainer  : aovieth@gmail.com
