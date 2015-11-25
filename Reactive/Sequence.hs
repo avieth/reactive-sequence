@@ -38,6 +38,7 @@ module Reactive.Sequence (
     , sBehaviorToBehavior
     , (|>)
     , always
+    , nothing
     , sequenceFirst
     , sequenceRest
     , bundle
@@ -56,6 +57,7 @@ module Reactive.Sequence (
     , switchSequence
     , Switchable
     , switchSequence'
+    , switch
     , sequenceReactimate
     , immediatelyAfter
     ) where
@@ -147,6 +149,9 @@ x |> y = Sequence (pure (x, pure y)) id
 
 always :: Applicative f => t -> Sequence f g t
 always x = pure x |> never
+
+nothing :: Sequence (Const ()) (Const Void) t
+nothing = (Const ()) |> never
 
 sequenceFirst :: Functor f => Sequence f g t -> MomentIO (f t)
 sequenceFirst (Sequence m f) = (fmap f . fst) <$> m
@@ -784,6 +789,22 @@ switchSequence' disambiguator = switchSequence (switchableCommuteF proxy)
   where
     proxy :: Proxy '(f1, f2, g1, g2)
     proxy = Proxy
+
+-- | Just a new name for @switchSequence'@
+switch
+    :: forall f1 f2 g1 g2 t .
+       ( Functor f1
+       , Functor f2
+       , Functor (SwitchableOutputF f1 f2 g1 g2)
+       , Functor g1
+       , Functor g2
+       , Functor (SwitchableOutputG f1 f2 g1 g2)
+       , Switchable f1 f2 g1 g2
+       )
+    => (t -> t -> t)
+    -> Sequence f1 g1 (Sequence f2 g2 t)
+    -> Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t
+switch = switchSequence'
 
 sequenceReactimate
     :: forall f g .
