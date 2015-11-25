@@ -43,6 +43,7 @@ module Reactive.Sequence (
     , bundle
     , Bundleable
     , bundle'
+    , (<%>)
     , (<⌚>)
     , sequenceUnion
     , Unionable
@@ -53,8 +54,8 @@ module Reactive.Sequence (
     , sequenceSwitch
     , sequenceSwitch'
     , switchSequence
-    , sSwitchE
-    , sSwitchE'
+    , Switchable
+    , switchSequence'
     , sequenceReactimate
     , immediatelyAfter
     ) where
@@ -586,10 +587,6 @@ sequenceSwitch transF transG sequence = do
                        (filterApply ((const . not) <$> esHasFired) first)
                        (filterApply (const <$> esHasFired) rest)
 
--- | Like switchE but when the events are in an SEvent.
-sSwitchE :: SEvent (Event t) -> MomentIO (Event t)
-sSwitchE = (fmap . fmap) runIdentity . sequenceSwitch (\_ -> never) (fmap Identity . runIdentity)
-
 -- | Like sequenceSwitch'' but we hide the MomentIO computation inside the
 --   Sequence, and gives Const () (i.e. nothing) for the initial value.
 sequenceSwitch'
@@ -640,7 +637,7 @@ switchSequence
     -> (forall t . f1 (Event (g2 t)) -> Event (g3 t))
     -> (forall t . Event (g1 (f2 t)) -> Event (g3 t))
     -> (forall t . g1 (Event (g2 t)) -> Event (g3 t))
-    -> (forall t . g3 t -> g3 t -> g3 t)
+    -> (g3 t -> g3 t -> g3 t)
     -> Sequence f1 g1 (Sequence f2 g2 t)
     -> Sequence f3 g3 t
 switchSequence commuteF1 commuteG1 joinF1F2 eventF1 eventG1F2 eventG1 disambiguatorG3 sequence = Sequence content id
@@ -648,13 +645,23 @@ switchSequence commuteF1 commuteG1 joinF1F2 eventF1 eventG1F2 eventG1 disambigua
     content :: MomentIO (f3 t, MomentIO (Event (g3 t)))
     content = do
 
+        -- To get the first part, we take the first part of the outer
+        -- @Sequence@, which is itself a @Sequenc@e, but guarded by @f1@.
         first :: f1 (Sequence f2 g2 t) <- sequenceFirst sequence
+        -- We then take the first part of the inner @Sequence@, to get a
+        -- @MomentIO (f2 t)@, and commute it with @f1@ to bring the @MomentIO@
+        -- out front.
+        -- So for example, if @f1 ~ Const ()@ because the outer @Sequence@ is
+        -- an @SEvent@, we'll just have @Const ()@ here; there is no initial
+        -- value of the switched @Sequence@.
         first' :: f1 (f2 t) <- commuteF1 (sequenceFirst <$> first)
 
         let rest' :: MomentIO (Event (g3 t))
             rest' = do
+                -- The remaining @Sequence@s in the outer @Sequence@.
                 rest :: Event (g1 (Sequence f2 g2 t)) <- sequenceRest sequence
-                -- The remaining elements of the first sequence.
+                -- The remaining elements of the first part of the outer
+                -- @Sequence@.
                 firstRest :: f1 (Event (g2 t))
                     <- commuteF1 (sequenceRest <$> first)
                 -- The first (immediate) elements of the remaining sequences.
@@ -678,15 +685,105 @@ switchSequence commuteF1 commuteG1 joinF1F2 eventF1 eventG1F2 eventG1 disambigua
 
         return (joinF1F2 first', rest')
 
--- Here it is, but will it work?
-sSwitchE' :: SEvent (SEvent t) -> SEvent t
-sSwitchE' = switchSequence (\_ -> pure (Const ()))
-                           (fmap Identity . runIdentity)
-                           (\_ -> Const ())
-                           (\_ -> never)
-                           (\_ -> never)
-                           (runIdentity)
-                           (\x y -> const <$> x <*> y)
+class Switchable f1 f2 g1 g2 where
+    type SwitchableOutputF f1 f2 g1 g2 :: * -> *
+    type SwitchableOutputG f1 f2 g1 g2 :: * -> *
+    switchableCommuteF
+        :: Proxy '(f1, f2, g1, g2)
+        -> (forall a . f1 (MomentIO a) -> MomentIO (f1 a))
+    switchableCommuteG
+        :: Proxy '(f1, f2, g1, g2)
+        -> (forall a . g1 (MomentIO a) -> MomentIO (g1 a))
+    switchableJoinF
+        :: Proxy '(f1, f2, g1, g2)
+        -> (forall a . f1 (f2 a) -> SwitchableOutputF f1 f2 g1 g2 a)
+    switchableJoinEventF
+        :: Proxy '(f1, f2, g1, g2)
+        -> (forall a . f1 (Event (g2 a)) -> Event (SwitchableOutputG f1 f2 g1 g2 a))
+    switchableJoinEventFG
+        :: Proxy '(f1, f2, g1, g2)
+        -> (forall a . Event (g1 (f2 a)) -> Event (SwitchableOutputG f1 f2 g1 g2 a))
+    switchableJoinEventG
+        :: Proxy '(f1, f2, g1, g2)
+        -> (forall a . g1 (Event (g2 a)) -> Event (SwitchableOutputG f1 f2 g1 g2 a))
+    switchableDisambiguator
+        :: Proxy '(f1, f2, g1, g2)
+        -> ( forall t .
+                (t -> t -> t)
+             -> SwitchableOutputG f1 f2 g1 g2 t
+             -> SwitchableOutputG f1 f2 g1 g2 t
+             -> SwitchableOutputG f1 f2 g1 g2 t
+           )
+
+-- | An event of behaviors gives no initial value.
+instance Switchable (Const ()) Identity Identity Identity where
+    type SwitchableOutputF (Const ()) Identity Identity Identity = (Const ())
+    type SwitchableOutputG (Const ()) Identity Identity Identity = Identity
+    switchableCommuteF _ = const (pure (Const ()))
+    switchableCommuteG _ = fmap Identity . runIdentity
+    switchableJoinF _ = const (Const ())
+    switchableJoinEventF _ = const never
+    switchableJoinEventFG _ = const never
+    switchableJoinEventG _ = runIdentity
+    switchableDisambiguator _ disambiguator l r = disambiguator <$> l <*> r
+
+-- | A behavior of events gives no initial value.
+instance Switchable Identity (Const ()) Identity Identity where
+    type SwitchableOutputF Identity (Const ()) Identity Identity = Const ()
+    type SwitchableOutputG Identity (Const ()) Identity Identity = Identity
+    switchableCommuteF _ = fmap Identity . runIdentity
+    switchableCommuteG _ = fmap Identity . runIdentity
+    switchableJoinF _ = const (Const ())
+    switchableJoinEventF _ = const never
+    switchableJoinEventFG _ = const never
+    switchableJoinEventG _ = runIdentity
+    switchableDisambiguator _ disambiguator l r = disambiguator <$> l <*> r
+
+instance Switchable (Const ()) (Const ()) Identity Identity where
+    type SwitchableOutputF (Const ()) (Const ()) Identity Identity = Const ()
+    type SwitchableOutputG (Const ()) (Const ()) Identity Identity = Identity
+    switchableCommuteF _ = const (pure (Const ()))
+    switchableCommuteG _ = fmap Identity . runIdentity
+    switchableJoinF _ = const (Const ())
+    switchableJoinEventF _ = const never
+    switchableJoinEventFG _ = const never
+    switchableJoinEventG _ = runIdentity
+    switchableDisambiguator _ disambiguator l r = disambiguator <$> l <*> r
+
+instance Switchable Identity Identity Identity Identity where
+    type SwitchableOutputF Identity Identity Identity Identity = Identity
+    type SwitchableOutputG Identity Identity Identity Identity = Identity
+    switchableCommuteF _ = fmap Identity . runIdentity
+    switchableCommuteG _ = fmap Identity . runIdentity
+    switchableJoinF _ = runIdentity
+    switchableJoinEventF _ = runIdentity
+    switchableJoinEventFG _ = fmap runIdentity
+    switchableJoinEventG _ = runIdentity
+    switchableDisambiguator _ disambiguator l r = disambiguator <$> l <*> r
+
+switchSequence'
+    :: forall f1 f2 g1 g2 t .
+       ( Functor f1
+       , Functor f2
+       , Functor (SwitchableOutputF f1 f2 g1 g2)
+       , Functor g1
+       , Functor g2
+       , Functor (SwitchableOutputG f1 f2 g1 g2)
+       , Switchable f1 f2 g1 g2
+       )
+    => (t -> t -> t)
+    -> Sequence f1 g1 (Sequence f2 g2 t)
+    -> Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t
+switchSequence' disambiguator = switchSequence (switchableCommuteF proxy)
+                                               (switchableCommuteG proxy)
+                                               (switchableJoinF proxy)
+                                               (switchableJoinEventF proxy)
+                                               (switchableJoinEventFG proxy)
+                                               (switchableJoinEventG proxy)
+                                               (switchableDisambiguator proxy disambiguator)
+  where
+    proxy :: Proxy '(f1, f2, g1, g2)
+    proxy = Proxy
 
 sequenceReactimate
     :: forall f g .
