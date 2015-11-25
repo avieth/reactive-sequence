@@ -139,14 +139,14 @@ instance
     , BundleableOutputG f f f f ~ f
     ) => Applicative (Sequence f f)
   where
-    pure = always . pure
+    pure = always
     (<*>) = (<%>)
 
 (|>) :: f t -> Event (g t) -> Sequence f g t
 x |> y = Sequence (pure (x, pure y)) id
 
-always :: f t -> Sequence f g t
-always x = x |> never
+always :: Applicative f => t -> Sequence f g t
+always x = pure x |> never
 
 sequenceFirst :: Functor f => Sequence f g t -> MomentIO (f t)
 sequenceFirst (Sequence m f) = (fmap f . fst) <$> m
