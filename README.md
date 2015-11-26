@@ -144,7 +144,7 @@ the `reactive-banana` combinators, but regardless, it can also be done using
 ```Haskell
 -- The type actually has constraints, and f3 and g3 are determined by
 -- f1, f2, g1, and g2.
-switch :: (t -> t -> t) -> Sequence f1 g1 (Sequence f2 g2 s) -> Sequence f3 g3 s
+switch :: (t -> t -> t) -> Sequence f1 g1 (Sequence f2 g2 s) -> MomentIO (Sequence f3 g3 s)
 ```
 
 Sepcializing to `SBehavior (SEvent t)`, we find that switching this gives
