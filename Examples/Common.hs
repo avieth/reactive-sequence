@@ -22,7 +22,8 @@ timedEvent :: Int -> IO t -> MomentIO (SEvent t, IO ())
 timedEvent timeout mk = do
     (ev, fire) <- newEvent
     threadId <- liftIO $ forkIO (fireRepeatedly timeout mk fire)
-    pure (eventToSEvent ev, killThread threadId)
+    sevent <- runSequenceM (eventToSEvent ev)
+    pure (sevent, killThread threadId)
   where
     fireRepeatedly timeout mk fire = do
         threadDelay timeout

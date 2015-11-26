@@ -9,6 +9,7 @@ Portability : non-portable (GHC only)
 -}
 
 {-# LANGUAGE AutoDeriveTypeable #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 import Data.IORef
 import Data.Functor.Identity
@@ -23,6 +24,7 @@ main = do
     killThreads <- newIORef []
 
     let networkDescription = do
+
             -- Every 1/2 of a second, fire event 1
             (ev1, kill1) <- timedEvent (round (1/2 * 1000000)) (pure "HALF")
             -- Every 1 second, fire event 2
@@ -37,10 +39,13 @@ main = do
             let ev :: SEvent (SEvent String)
                 ev = getFirst <$> ((First <$> ev3) <||> (First <$> ev4))
 
-            let ev' :: SEvent String
-                ev' = switch const ev
+            ev' :: SEvent String
+                <- runSequenceM $ switch const ev
 
-            sequenceReactimate (const (pure ())) (runIdentity) (putStrLn <$> (((++) "Event: ") <$> ev'))
+            runSequenceM $
+                sequenceReactimate (const (pure ()))
+                                   (runIdentity)
+                                   (putStrLn <$> (((++) "Event: ") <$> ev'))
 
             liftIO $ writeIORef killThreads [kill1, kill2, kill3, kill4]
 

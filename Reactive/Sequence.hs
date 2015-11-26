@@ -34,13 +34,10 @@ module Reactive.Sequence (
     , SBehavior
     , sequenceTrans
     , (|>)
-    , (||>)
     , always
     , nothing
-    , sequenceFirst
-    , sequenceRest
-    , sequenceLag
-    , sBehaviorLag
+    , lag
+    , lag'
     , sEventToSBehavior
     , sBehaviorToSEvent
     , eventToSEvent
@@ -136,21 +133,15 @@ type SEvent = Sequence (Const ()) Identity
 --   contains enough information to produce a @Behavior@.
 type SBehavior = Sequence Identity Identity
 
-(|>) :: f t -> Event (g t) -> Sequence f g t
-x |> y = Sequence content id
-  where
-    content = do
-        z <- immediatelyAfter y
-        pure (x, pure y, z)
-
-(||>) :: t -> SEvent t -> MomentIO (SBehavior t)
-(||>) = sEventToSBehavior
+-- | Analogous to @stepper@.
+(|>) :: t -> SEvent t -> SequenceM (SBehavior t)
+(|>) = sEventToSBehavior
 
 always :: Applicative f => t -> Sequence f g t
-always x = pure x |> never
+always x = Sequence (pure (pure x, pure never, never)) id
 
 nothing :: Sequence (Const ()) (Const Void) t
-nothing = (Const ()) |> never
+nothing = Sequence (pure (Const (), pure never, never)) id
 
 sequenceFirst :: Functor f => Sequence f g t -> MomentIO (f t)
 sequenceFirst (Sequence m f) = do
@@ -172,17 +163,40 @@ sequenceLag (Sequence m f) = do
 --   same initial value, but the changes to the output happen immediately after
 --   the changes to the input. Forcing the changes to the output does not
 --   force the changes to the input.
-sBehaviorLag :: SBehavior t -> MomentIO (SBehavior t)
-sBehaviorLag sequence = do
+lag :: (Functor f, Functor g) => Sequence f g t -> SequenceM (Sequence f g t)
+lag sequence = SequenceM $ do
     first <- sequenceFirst sequence
     rest <- sequenceLag sequence
     (lag, fire) <- newEvent
     reactimate (fire <$> rest)
     pure (Sequence (pure (first, pure rest, lag)) id)
 
+-- | Like @lag@, but stricter: forcing its changes *will* force the changes to
+--   the thing from which it's derived. Useful if you want to get an event
+--   immediately after another, whereas @lag@ is more useful in case you want
+--   to do some recursion.
+lag' :: (Functor f, Functor g) => Sequence f g t -> SequenceM (Sequence f g t)
+lag' sequence = SequenceM $ do
+    first <- sequenceFirst sequence
+    rest <- sequenceRest sequence
+    lag <- sequenceLag sequence
+    rest' <- immediatelyAfter rest
+    lag' <- immediatelyAfter lag
+    pure (Sequence (pure (first, pure rest', lag')) id)
+
+{-
+sBehaviorLag :: SBehavior t -> SequenceM (SBehavior t)
+sBehaviorLag sequence = SequenceM $ do
+    first <- sequenceFirst sequence
+    rest <- sequenceLag sequence
+    (lag, fire) <- newEvent
+    reactimate (fire <$> rest)
+    pure (Sequence (pure (first, pure rest, lag)) id)
+-}
+
 -- | Analogous to @stepper@.
-sEventToSBehavior :: t -> SEvent t -> MomentIO (SBehavior t)
-sEventToSBehavior t sevent = do
+sEventToSBehavior :: t -> SEvent t -> SequenceM (SBehavior t)
+sEventToSBehavior t sevent = SequenceM $ do
     (lag, fire) <- newEvent
     let theRest = do
             rest <- sequenceRest sevent
@@ -190,21 +204,45 @@ sEventToSBehavior t sevent = do
             return rest
     pure (Sequence (pure (Identity t, theRest, lag)) id)
 
+-- What are the implications of dumping the monadic part inside the derived
+-- sequence? Every time you ask for the first or rest you get a new lag
+-- event. Maybe that's ok?
+{-
+sEventToSBehavior :: t -> SEvent t -> SBehavior t
+sEventToSBehavior t sevent = Sequence content id
+  where
+    content = do
+        (lag, fire) <- newEvent
+        let theRest = do
+                rest <- sequenceRest sevent
+                reactimate (fire <$> rest)
+                return rest
+        pure (Identity t, theRest, lag)
+-}
+
 -- | @SEvent@ is at least as big as @Event@.
+eventToSEvent :: Event t -> SequenceM (SEvent t)
+eventToSEvent ev = SequenceM $ do
+    lag <- immediatelyAfter ev
+    pure (Sequence (pure (Const (), pure (Identity <$> ev), Identity <$> lag)) id)
+{-
+-- Does this make a difference compared to the current one? Maybe we should
+-- prefer it?
 eventToSEvent :: Event t -> SEvent t
 eventToSEvent ev = Sequence content id
   where
     content = do
         lag <- immediatelyAfter ev
         pure (Const (), pure (Identity <$> ev), Identity <$> lag)
+-}
 
 -- | An @Event@ can be recovered from any @SEvent@.
-sEventToEvent :: SEvent t -> MomentIO (Event t)
-sEventToEvent sevent = (fmap . fmap) runIdentity (sequenceRest sevent)
+sEventToEvent :: SEvent t -> SequenceM (Event t)
+sEventToEvent sevent = SequenceM $ (fmap . fmap) runIdentity (sequenceRest sevent)
 
 -- | A @Behavior@ can be recovered from any @SBehavior@.
-sBehaviorToBehavior :: SBehavior t -> MomentIO (Behavior t)
-sBehaviorToBehavior sbehavior = do
+sBehaviorToBehavior :: SBehavior t -> SequenceM (Behavior t)
+sBehaviorToBehavior sbehavior = SequenceM $ do
     initial :: Identity t <- sequenceFirst sbehavior
     rest :: Event (Identity t) <- sequenceRest sbehavior
     b <- stepper initial rest
@@ -616,12 +654,14 @@ infixl 4 <%
 left <% right = (uncurry ($)) <$> (bundleRight' left right)
 
 -- | Define an SBehavior in terms of its own Behavior
-fixSBehavior :: forall t . (SBehavior t -> MomentIO (SBehavior t)) -> MomentIO (SBehavior t)
+fixSBehavior
+    :: forall t .
+       ( SBehavior t -> SequenceM (SBehavior t) )
+    -> SequenceM (SBehavior t)
 fixSBehavior makeIt = mdo
     sbehavior <- makeIt lagged
-    lagged <- sBehaviorLag sbehavior
-    sequenceReactimate runIdentity runIdentity ((const (putStrLn "LAG 1")) <$> lagged)
-    return sbehavior
+    lagged <- lag sbehavior
+    pure sbehavior
 
 -- | Sort of like @<|>@, as @<%>@ is for @<*>@. This combinator gives the
 --   @Sequence@ of the *latest* values for both input @Sequence@s, subject
@@ -780,8 +820,8 @@ sequenceCommute
     => (forall s . f (MomentIO s) -> MomentIO (f s))
     -> (forall s . g (MomentIO s) -> MomentIO (g s))
     -> Sequence f g (MomentIO t)
-    -> MomentIO (Sequence f g t)
-sequenceCommute commuteF commuteG sequence = do
+    -> SequenceM (Sequence f g t)
+sequenceCommute commuteF commuteG sequence = SequenceM $ do
     first :: f (MomentIO t) <- sequenceFirst sequence
     rest :: Event (g (MomentIO t)) <- sequenceRest sequence
     executedFirst <- commuteF first
@@ -818,7 +858,7 @@ switchSequence
     -> (forall t . g1 (Event (g2 t)) -> Event (g3 t))
     -> (g3 t -> g3 t -> g3 t)
     -> Sequence f1 g1 (Sequence f2 g2 t)
-    -> MomentIO (Sequence f3 g3 t)
+    -> SequenceM (Sequence f3 g3 t)
 switchSequence commuteF1
                commuteG1
                joinF1F2
@@ -827,7 +867,8 @@ switchSequence commuteF1
                eventG1
                disambiguatorG3
                sequence
-    = do  -- To get the first part, we take the first part of the outer
+    = SequenceM $ do 
+          -- To get the first part, we take the first part of the outer
           -- @Sequence@, which is itself a @Sequenc@e, but guarded by @f1@.
           first :: f1 (Sequence f2 g2 t) <- sequenceFirst sequence
           -- We then take the first part of the inner @Sequence@, to get a
@@ -966,7 +1007,7 @@ switchSequence'
        )
     => (t -> t -> t)
     -> Sequence f1 g1 (Sequence f2 g2 t)
-    -> MomentIO (Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t)
+    -> SequenceM (Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t)
 switchSequence' disambiguator = switchSequence (switchableCommuteF proxy)
                                                (switchableCommuteG proxy)
                                                (switchableJoinF proxy)
@@ -991,7 +1032,7 @@ switch
        )
     => (t -> t -> t)
     -> Sequence f1 g1 (Sequence f2 g2 t)
-    -> MomentIO (Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t)
+    -> SequenceM (Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t)
 switch = switchSequence'
 
 sequenceReactimate
@@ -1000,8 +1041,8 @@ sequenceReactimate
     => (f (IO ()) -> IO ())
     -> (g (IO ()) -> IO ())
     -> Sequence f g (IO ())
-    -> MomentIO ()
-sequenceReactimate elimF elimG sequence = do
+    -> SequenceM ()
+sequenceReactimate elimF elimG sequence = SequenceM $ do
     first :: f (IO ()) <- sequenceFirst sequence
     rest :: Event (g (IO ())) <- sequenceRest sequence
     liftIO (elimF first)

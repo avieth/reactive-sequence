@@ -9,6 +9,7 @@ Portability : non-portable (GHC only)
 -}
 
 {-# LANGUAGE AutoDeriveTypeable #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 import Data.IORef
 import Data.Functor.Identity
@@ -36,26 +37,27 @@ main = do
             let bundle1 :: SEvent (String, String, String)
                 bundle1 = (,,) <$> ev1 <%> ev2 <%> ev3
 
-            let be1 :: SBehavior String
-                be1 = sEventToSBehavior "initial 1" ev1
+            be1 :: SBehavior String
+                <- runSequenceM $ sEventToSBehavior "initial 1" ev1
 
-            let be2 :: SBehavior String
-                be2 = sEventToSBehavior "initial 2" ev2
+            be2 :: SBehavior String
+                <- runSequenceM $ sEventToSBehavior "initial 2" ev2
 
-            let be3 :: SBehavior String
-                be3 = sEventToSBehavior "initial 3" ev3
+            be3 :: SBehavior String
+                <- runSequenceM $ sEventToSBehavior "initial 3" ev3
 
             -- By adding initial values, we can bundle a behavior.
             let bundle2 :: SBehavior (String, String, String)
                 bundle2 = (,,) <$> be1 <%> be2 <%> be3
 
-            -- Notice that when we reactimate the SEvent, we can give
-            -- const (pure ()) for the first argument, meaning no IO will
-            -- happen immediately, as there is no initial value.
-            sequenceReactimate (const (pure ())) (runIdentity) (print <$> ((,) "Event" <$> bundle1))
-            -- This will fire *many* times before the above reactimate,
-            -- for every event of ev1, ev2, or ev3 causes it to run.
-            sequenceReactimate (runIdentity) (runIdentity) (print <$> ((,) "Behavior" <$> bundle2))
+            runSequenceM $ do
+                -- Notice that when we reactimate the SEvent, we can give
+                -- const (pure ()) for the first argument, meaning no IO will
+                -- happen immediately, as there is no initial value.
+                sequenceReactimate (const (pure ())) (runIdentity) (print <$> ((,) "Event" <$> bundle1))
+                -- This will fire *many* times before the above reactimate,
+                -- for every event of ev1, ev2, or ev3 causes it to run.
+                sequenceReactimate (runIdentity) (runIdentity) (print <$> ((,) "Behavior" <$> bundle2))
 
             liftIO $ writeIORef killThreads [kill1, kill2, kill3]
 

@@ -46,7 +46,9 @@ main = do
             let bundle1 :: SEvent ((), Int, String)
                 bundle1 = (,,) <$> ev1 <% ev2 <% ev3
 
-            sequenceReactimate (const (pure ())) (runIdentity) (print <$> ((,) "Event 1" <$> bundle1))
+            runSequenceM $ sequenceReactimate (const (pure ()))
+                                              (runIdentity)
+                                              (print <$> ((,) "Event 1" <$> bundle1))
 
             -- This one will fire every half second once both events have fired
             -- at least once, with the latest from both events.
@@ -55,7 +57,9 @@ main = do
             let bundle2 :: SEvent ((), Int)
                 bundle2 = (,) <$> ev1 %> ev2
 
-            sequenceReactimate (const (pure ())) (runIdentity) (print <$> ((,) "Event 2" <$> bundle2))
+            runSequenceM $ sequenceReactimate (const (pure ()))
+                                              (runIdentity)
+                                              (print <$> ((,) "Event 2" <$> bundle2))
 
             liftIO $ writeIORef killThreads [kill1, kill2, kill3]
 

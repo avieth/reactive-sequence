@@ -9,6 +9,7 @@ Portability : non-portable (GHC only)
 -}
 
 {-# LANGUAGE AutoDeriveTypeable #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 import Data.IORef
 import Data.Functor.Identity
@@ -22,6 +23,7 @@ main = do
     killThreads <- newIORef []
 
     let networkDescription = do
+
             -- Every 1/2 of a second, fire event 1
             (ev1, kill1) <- timedEvent (round (1/2 * 1000000)) (pure "HALF")
             -- Every 1 second, fire event 2
@@ -34,8 +36,8 @@ main = do
             let union1 :: SEvent String
                 union1 = ev1 <||> ev2 <||> ev3
 
-            let be1 :: SBehavior String
-                be1 = sEventToSBehavior "Initial" ev1
+            be1 :: SBehavior String
+                <- runSequenceM (sEventToSBehavior "Initial" ev1)
 
             -- If we introduce an SBehavior, then our union becomes an
             -- SBehavior: the initial value is simply the initial value of
@@ -43,8 +45,9 @@ main = do
             let union2 :: SBehavior String
                 union2 = be1 <||> ev2 <||> ev3
 
-            sequenceReactimate (const (pure ())) (runIdentity) (putStrLn <$> (((++) "Union 1: ") <$> union1))
-            sequenceReactimate (runIdentity) (runIdentity) (putStrLn <$> (((++) "Union 2: ") <$> union2))
+            runSequenceM $ do
+                sequenceReactimate (const (pure ())) (runIdentity) (putStrLn <$> (((++) "Union 1: ") <$> union1))
+                sequenceReactimate (runIdentity) (runIdentity) (putStrLn <$> (((++) "Union 2: ") <$> union2))
 
             liftIO $ writeIORef killThreads [kill1, kill2, kill3]
 
