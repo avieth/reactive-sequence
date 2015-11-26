@@ -26,7 +26,9 @@ Portability : non-portable (GHC only)
 {-# LANGUAGE UndecidableInstances #-}
 
 module Reactive.Sequence (
-      Sequence(..)
+      SequenceM
+    , runSequenceM
+    , Sequence(..)
     , SValue
     , SEvent
     , SBehavior
@@ -39,24 +41,21 @@ module Reactive.Sequence (
     , sequenceRest
     , sequenceLag
     , sBehaviorLag
-    , sBehaviorLag'
     , sEventToSBehavior
-    , sEventToSBehavior'
     , sBehaviorToSEvent
     , eventToSEvent
     , sEventToEvent
     , sBehaviorToBehavior
-    , bundle
-    , bundleLeft
-    , bundleRight
-    , (<%)
-    , (%>)
     , fixSBehavior
-    , fixSBehavior'
+    , bundle
     , Bundleable
     , bundle'
+    , bundleLeft'
+    , bundleRight'
     , (<%>)
     , (<⌚>)
+    , (<%)
+    , (%>)
     , sequenceUnion
     , Unionable
     , UnionsTo
@@ -72,6 +71,7 @@ module Reactive.Sequence (
     , immediatelyAfter
     ) where
 
+import Control.Monad.Fix
 import Control.Monad.IO.Class
 import Data.Void
 import Data.Proxy
@@ -86,6 +86,22 @@ immediatelyAfter ev = do
     (ev', fire) <- newEvent
     reactimate (fire <$> ev)
     return ev'
+
+-- | TODO use this instead of MomentIO in the sequence combinators. Useful to
+--   identify a subset of MomentIO which can't do just anything (this is not
+--   MonadIO, and its constructor is not exported).
+newtype SequenceM t = SequenceM {
+      outSequenceM :: MomentIO t
+    }
+
+runSequenceM :: SequenceM t -> MomentIO t
+runSequenceM = outSequenceM
+
+deriving instance Functor SequenceM
+deriving instance Applicative SequenceM
+deriving instance Monad SequenceM
+deriving instance MonadFix SequenceM
+deriving instance MonadMoment SequenceM
 
 -- | A @Sequence@ is like an @Event@, and also like a @Behavior@. It's
 --   one functorial value, followed by an @Event@ bringing more functorial
@@ -127,7 +143,7 @@ x |> y = Sequence content id
         z <- immediatelyAfter y
         pure (x, pure y, z)
 
-(||>) :: t -> SEvent t -> SBehavior t
+(||>) :: t -> SEvent t -> MomentIO (SBehavior t)
 (||>) = sEventToSBehavior
 
 always :: Applicative f => t -> Sequence f g t
@@ -156,21 +172,8 @@ sequenceLag (Sequence m f) = do
 --   same initial value, but the changes to the output happen immediately after
 --   the changes to the input. Forcing the changes to the output does not
 --   force the changes to the input.
-sBehaviorLag :: SBehavior t -> SBehavior t
-sBehaviorLag sequence = Sequence content id
-  where
-    content = do
-        first <- sequenceFirst sequence
-        (lag, fire) <- newEvent
-        let rest = do
-                -- NB we take sequenceLag, not sequenceRest!
-                rest' <- sequenceLag sequence
-                reactimate (fire <$> rest')
-                pure rest'
-        pure (first, rest, lag)
-
-sBehaviorLag' :: SBehavior t -> MomentIO (SBehavior t)
-sBehaviorLag' sequence = do
+sBehaviorLag :: SBehavior t -> MomentIO (SBehavior t)
+sBehaviorLag sequence = do
     first <- sequenceFirst sequence
     rest <- sequenceLag sequence
     (lag, fire) <- newEvent
@@ -178,21 +181,8 @@ sBehaviorLag' sequence = do
     pure (Sequence (pure (first, pure rest, lag)) id)
 
 -- | Analogous to @stepper@.
-sEventToSBehavior :: t -> SEvent t -> SBehavior t
-sEventToSBehavior t sevent = Sequence content id
-  where
-    content = do
-        -- MUST NOT pull the sequenceLag from the input event. That would
-        -- make it more difficult to define circular networks.
-        (lag, fire) <- newEvent
-        let theRest = do
-                rest <- sequenceRest sevent
-                reactimate (fire <$> rest)
-                pure rest
-        pure (Identity t, sequenceRest sevent, lag)
-
-sEventToSBehavior' :: t -> SEvent t -> MomentIO (SBehavior t)
-sEventToSBehavior' t sevent = do
+sEventToSBehavior :: t -> SEvent t -> MomentIO (SBehavior t)
+sEventToSBehavior t sevent = do
     (lag, fire) <- newEvent
     let theRest = do
             rest <- sequenceRest sevent
@@ -264,8 +254,17 @@ instance
     pure = always
     (<*>) = (<%>)
 
--- | A more general form of @bundle@, in which the @Sequence@s can have
---   disparate functor parameters.
+-- | Combine two @Sequence@s.
+--
+--   This is general enough to express variants in which the resulting
+--   sequence's event fires iff *one* of the input sequences fires, akin to
+--   <@ from reactive-banana. It's obtain by choosing appropriate functions
+--     (forall a . g1 s -> Maybe (g3 s))
+--     (forall a . g2 s -> Maybe (g3 s))
+--   These are run against every occurrence of the left (g1) and right (g2)
+--   events (except for the immediate parts, which are irrelevant to this
+--   discussion). Giving @Nothing@ means it should not fire, and giving
+--   @Just@ means it should.
 bundle
     :: forall f1 f2 f3 g1 g2 g3 h s t .
        ( Applicative f1
@@ -278,8 +277,17 @@ bundle
        )
     => (forall a . f1 a -> f3 a)
     -> (forall a . f2 a -> f3 a)
-    -> (forall a . g1 a -> g3 a)
-    -> (forall a . g2 a -> g3 a)
+    -> (forall a . g1 a -> Maybe (g3 a)) -- ^ Decide whether the left should
+                                         --   be squelched, and if not, how
+                                         --   to convert it to g3.
+                                         --   Even if you give Nothing, the
+                                         --   changes to the left are still
+                                         --   observed, so that its latest
+                                         --   value is used whenever the right
+                                         --   fires.
+    -> (forall a . g2 a -> Maybe (g3 a)) -- ^ Decide whether the right should
+                                         --   be squelched, and if not, how
+                                         --   to convert it to g3.
     -> (forall a . f1 a -> h a)
     -> (forall a . f2 a -> h a)
     -> (forall a . g1 a -> h a)
@@ -288,7 +296,18 @@ bundle
     -> Sequence f1 g1 s
     -> Sequence f2 g2 t
     -> Sequence f3 g3 (s, t)
-bundle transF1 transF2 transG1 transG2 transF1H transF2H transG1H transG2H outH left right = Sequence content id
+bundle transF1
+       transF2
+       transG1
+       transG2
+       transF1H
+       transF2H
+       transG1H
+       transG2H
+       outH
+       left
+       right
+   = Sequence content id
   where
 
     content :: MomentIO (f3 (s, t), MomentIO (Event (g3 (s, t))), Event (g3 (s, t)))
@@ -330,66 +349,16 @@ bundle transF1 transF2 transG1 transG2 transF1H transF2H transG1H transG2H outH 
         let pick :: ((h s, h t), EitherBoth (g1 s) (g2 t)) -> Maybe (g3 (s, t))
             pick x = case x of
                 -- If both fire, just give them.
-                (_, Both s t) -> Just ((,) <$> transG1 s <*> transG2 t)
+                (_, Both s t) -> (\l r -> (,) <$> l <*> r) <$> transG1 s <*> transG2 t
                 -- If only one fires, give the latest tuple, but only
                 -- if the behavior yields a g3.
                 ((_, t), OneLeft s) -> case outH t of
                     Left _ -> Nothing
-                    Right t' -> Just ((,) <$> transG1 s <*> t')
+                    Right t' -> (\l r -> (,) <$> l <*> r) <$> transG1 s <*> pure t'
                 ((s, _), OneRight t) -> case outH s of
                     Left _ -> Nothing
-                    Right s' -> Just ((,) <$> s' <*> transG2 t)
+                    Right s' -> (\l r -> (,) <$> l <*> r) <$> pure s' <*> transG2 t
         return (filterJust (pick <$> evLR'))
-
--- | Bundle with a regular Behavior. The resulting SEvent fires
-bundleLeft
-    :: forall f g s t .
-       ( Applicative f, Applicative g )
-    => (forall a . f (MomentIO a) -> MomentIO (f a))
-    -> Behavior s
-    -> Sequence f g t
-    -> Sequence f g (s, t)
-bundleLeft commuteF behavior sequence = Sequence content id
-  where
-    content :: MomentIO (f (s, t), MomentIO (Event (g (s, t))), Event (g (s, t)))
-    content = do
-        ft :: f t <- sequenceFirst sequence
-        let makeFirst :: t -> MomentIO (s, t)
-            makeFirst t = do
-                s <- valueB behavior
-                return (s, t)
-        first :: f (s, t) <- commuteF (makeFirst <$> ft)
-        let theRest :: MomentIO (Event (g (s, t)))
-            theRest = (\ev -> (fmap . (,)) <$> behavior <@> ev) <$> (sequenceRest sequence)
-        lag :: Event (g t) <- sequenceLag sequence
-        let theLag :: Event (g (s, t))
-            theLag = (fmap . (,)) <$> behavior <@> lag
-        pure (first, theRest, theLag)
-
-bundleRight
-    :: forall f g s t .
-       ( Applicative f, Applicative g )
-    => (forall a . f (MomentIO a) -> MomentIO (f a))
-    -> Sequence f g t
-    -> Behavior s
-    -> Sequence f g (t, s)
-bundleRight commuteF left right = swap <$> bundleLeft commuteF right left
-  where
-    swap (x, y) = (y, x)
-
-infixl 4 <%
-(<%)
-    :: Behavior (s -> t)
-    -> SEvent s
-    -> SEvent t
-(<%) left right = (uncurry ($)) <$> (bundleLeft (const (pure (Const ()))) left right)
-
-infixl 4 %>
-(%>)
-    :: SEvent (s -> t)
-    -> Behavior s
-    -> SEvent t
-(%>) left right = (uncurry ($)) <$> (bundleRight (const (pure (Const ()))) left right)
 
 class Bundleable (f1 :: * -> *) (f2 :: * -> *) (g1 :: * -> *) (g2 :: * -> *) where
     type BundleableOutputF f1 f2 g1 g2 :: * -> *
@@ -403,10 +372,10 @@ class Bundleable (f1 :: * -> *) (f2 :: * -> *) (g1 :: * -> *) (g2 :: * -> *) whe
         -> (forall a . f2 a -> BundleableOutputF f1 f2 g1 g2 a)
     bundleTransG1
         :: Proxy '(f1, f2, g1, g2)
-        -> (forall a . g1 a -> BundleableOutputG f1 f2 g1 g2 a)
+        -> (forall a . g1 a -> Maybe (BundleableOutputG f1 f2 g1 g2 a))
     bundleTransG2
         :: Proxy '(f1, f2, g1, g2)
-        -> (forall a . g2 a -> BundleableOutputG f1 f2 g1 g2 a)
+        -> (forall a . g2 a -> Maybe (BundleableOutputG f1 f2 g1 g2 a))
     bundleTransIntermediateF1
         :: Proxy '(f1, f2, g1, g2)
         -> (forall a . f1 a -> BundleableIntermediate f1 f2 g1 g2 a)
@@ -430,8 +399,8 @@ instance Bundleable (Const ()) Identity Identity Identity where
     type BundleableIntermediate (Const ()) Identity Identity Identity = Maybe
     bundleTransF1 _ = const (Const ())
     bundleTransF2 _ = const (Const ())
-    bundleTransG1 _ = id
-    bundleTransG2 _ = id
+    bundleTransG1 _ = Just
+    bundleTransG2 _ = Just
     bundleTransIntermediateF1 _ = const Nothing
     bundleTransIntermediateF2 _ = Just . runIdentity
     bundleTransIntermediateG1 _ = Just . runIdentity
@@ -445,8 +414,8 @@ instance Bundleable Identity (Const ()) Identity Identity where
     type BundleableIntermediate Identity (Const ()) Identity Identity = Maybe
     bundleTransF1 _ = const (Const ())
     bundleTransF2 _ = const (Const ())
-    bundleTransG1 _ = id
-    bundleTransG2 _ = id
+    bundleTransG1 _ = Just
+    bundleTransG2 _ = Just
     bundleTransIntermediateF1 _ = Just . runIdentity
     bundleTransIntermediateF2 _ = const Nothing
     bundleTransIntermediateG1 _ = Just . runIdentity
@@ -460,8 +429,8 @@ instance Bundleable (Const ()) (Const ()) Identity Identity where
     type BundleableIntermediate (Const ()) (Const ()) Identity Identity = Maybe
     bundleTransF1 _ = const (Const ())
     bundleTransF2 _ = const (Const ())
-    bundleTransG1 _ = id
-    bundleTransG2 _ = id
+    bundleTransG1 _ = Just
+    bundleTransG2 _ = Just
     bundleTransIntermediateF1 _ = const Nothing
     bundleTransIntermediateF2 _ = const Nothing
     bundleTransIntermediateG1 _ = Just . runIdentity
@@ -475,8 +444,8 @@ instance Bundleable Identity Identity Identity Identity where
     type BundleableIntermediate Identity Identity Identity Identity = Identity
     bundleTransF1 _ = id
     bundleTransF2 _ = id
-    bundleTransG1 _ = id
-    bundleTransG2 _ = id
+    bundleTransG1 _ = Just
+    bundleTransG2 _ = Just
     bundleTransIntermediateF1 _ = id
     bundleTransIntermediateF2 _ = id
     bundleTransIntermediateG1 _ = id
@@ -510,6 +479,63 @@ bundle' = bundle (bundleTransF1 proxy)
                  (bundleTransIntermediateG1 proxy)
                  (bundleTransIntermediateG2 proxy)
                  (bundleIntermediateOut proxy)
+  where
+    proxy :: Proxy '(f1, f2, g1, g2)
+    proxy = Proxy
+
+-- | Bundle but only fire when the right one fires. This is like <@ from
+--   reactive-banana.
+bundleRight'
+    :: forall f1 f2 g1 g2 s t .
+       ( Applicative f1
+       , Applicative f2
+       , Applicative (BundleableOutputF f1 f2 g1 g2)
+       , Applicative g1
+       , Applicative g2
+       , Applicative (BundleableOutputG f1 f2 g1 g2)
+       , Applicative (BundleableIntermediate f1 f2 g1 g2)
+       , Bundleable f1 f2 g1 g2
+       )
+    => Sequence f1 g1 s
+    -> Sequence f2 g2 t
+    -> Sequence (BundleableOutputF f1 f2 g1 g2) (BundleableOutputG f1 f2 g1 g2) (s, t)
+bundleRight' = bundle (bundleTransF1 proxy)
+                      (bundleTransF2 proxy)
+                      (const Nothing)
+                      (bundleTransG2 proxy)
+                      (bundleTransIntermediateF1 proxy)
+                      (bundleTransIntermediateF2 proxy)
+                      (bundleTransIntermediateG1 proxy)
+                      (bundleTransIntermediateG2 proxy)
+                      (bundleIntermediateOut proxy)
+  where
+    proxy :: Proxy '(f1, f2, g1, g2)
+    proxy = Proxy
+
+-- | Bundle but only fire when the left one fires.
+bundleLeft'
+    :: forall f1 f2 g1 g2 s t .
+       ( Applicative f1
+       , Applicative f2
+       , Applicative (BundleableOutputF f1 f2 g1 g2)
+       , Applicative g1
+       , Applicative g2
+       , Applicative (BundleableOutputG f1 f2 g1 g2)
+       , Applicative (BundleableIntermediate f1 f2 g1 g2)
+       , Bundleable f1 f2 g1 g2
+       )
+    => Sequence f1 g1 s
+    -> Sequence f2 g2 t
+    -> Sequence (BundleableOutputF f1 f2 g1 g2) (BundleableOutputG f1 f2 g1 g2) (s, t)
+bundleLeft' = bundle (bundleTransF1 proxy)
+                     (bundleTransF2 proxy)
+                     (bundleTransG1 proxy)
+                     (const Nothing)
+                     (bundleTransIntermediateF1 proxy)
+                     (bundleTransIntermediateF2 proxy)
+                     (bundleTransIntermediateG1 proxy)
+                     (bundleTransIntermediateG2 proxy)
+                     (bundleIntermediateOut proxy)
   where
     proxy :: Proxy '(f1, f2, g1, g2)
     proxy = Proxy
@@ -550,24 +576,52 @@ infixl 4 <⌚>
     -> Sequence (BundleableOutputF f1 f2 g1 g2) (BundleableOutputG f1 f2 g1 g2) t
 (<⌚>) = (<%>)
 
+infixl 4 %>
+-- | Notice how it points in the opposite direction from the one
+--   indicated by the name @bundlLeft'@. That's because we want to be consistent
+--   with reactive-banana's <@ operator, which fires only when the right-hand
+--   term fires. This one fires only when the left-hand term fires, hence the
+--   use of @bundleLeft'@.
+(%>)
+    :: forall f1 f2 g1 g2 s t .
+       ( Applicative f1
+       , Applicative f2
+       , Applicative (BundleableOutputF f1 f2 g1 g2)
+       , Applicative g1
+       , Applicative g2
+       , Applicative (BundleableOutputG f1 f2 g1 g2)
+       , Applicative (BundleableIntermediate f1 f2 g1 g2)
+       , Bundleable f1 f2 g1 g2
+       )
+    => Sequence f1 g1 (s -> t)
+    -> Sequence f2 g2 s
+    -> Sequence (BundleableOutputF f1 f2 g1 g2) (BundleableOutputG f1 f2 g1 g2) t
+left %> right = (uncurry ($)) <$> (bundleLeft' left right)
+
+infixl 4 <%
+(<%)
+    :: forall f1 f2 g1 g2 s t .
+       ( Applicative f1
+       , Applicative f2
+       , Applicative (BundleableOutputF f1 f2 g1 g2)
+       , Applicative g1
+       , Applicative g2
+       , Applicative (BundleableOutputG f1 f2 g1 g2)
+       , Applicative (BundleableIntermediate f1 f2 g1 g2)
+       , Bundleable f1 f2 g1 g2
+       )
+    => Sequence f1 g1 (s -> t)
+    -> Sequence f2 g2 s
+    -> Sequence (BundleableOutputF f1 f2 g1 g2) (BundleableOutputG f1 f2 g1 g2) t
+left <% right = (uncurry ($)) <$> (bundleRight' left right)
 
 -- | Define an SBehavior in terms of its own Behavior
-fixSBehavior :: forall t . (Behavior t -> SBehavior t) -> MomentIO (SBehavior t)
+fixSBehavior :: forall t . (SBehavior t -> MomentIO (SBehavior t)) -> MomentIO (SBehavior t)
 fixSBehavior makeIt = mdo
-    let sequence = makeIt be
-    be <- sBehaviorToBehavior sequence
-    return sequence
-
-fixSBehavior' :: forall t . (Behavior t -> SBehavior t) -> SBehavior t
-fixSBehavior' makeIt = Sequence content id
-  where
-    content :: MomentIO (Identity t, MomentIO (Event (Identity t)), Event (Identity t))
-    content = mdo
-        let sequence = makeIt bs
-        bs <- sBehaviorToBehavior sequence
-        first <- sequenceFirst sequence
-        lag <- sequenceLag sequence
-        pure (first, sequenceRest sequence, lag)
+    sbehavior <- makeIt lagged
+    lagged <- sBehaviorLag sbehavior
+    sequenceReactimate runIdentity runIdentity ((const (putStrLn "LAG 1")) <$> lagged)
+    return sbehavior
 
 -- | Sort of like @<|>@, as @<%>@ is for @<*>@. This combinator gives the
 --   @Sequence@ of the *latest* values for both input @Sequence@s, subject
@@ -735,32 +789,6 @@ sequenceCommute commuteF commuteG sequence = do
     (lag, fire) <- newEvent
     reactimate (fire <$> executedRest)
     pure (Sequence (pure (executedFirst, pure executedRest, lag)) id)
-
-{-
-sequenceCommute
-    :: forall f g t .
-       ( Functor f, Functor g )
-    => (forall s . f (MomentIO s) -> MomentIO (f s))
-    -> (forall s . g (MomentIO s) -> MomentIO (g s))
-    -> Sequence f g (MomentIO t)
-    -> Sequence f g t
-sequenceCommute commuteF commuteG sequence = Sequence content id
-  where
-    content :: MomentIO (f t, MomentIO (Event (g t)), Event (g t))
-    content = do
-        first :: f (MomentIO t) <- sequenceFirst sequence
-        first' :: f t <- commuteF first
-        -- Careful to create a new event, rather than executing the existing
-        -- lag. Since execute has side-effects, that's not what we want.
-        (lag, fire) <- newEvent
-        let theRest :: MomentIO (Event (g t))
-            theRest = do
-                rest :: Event (g (MomentIO t)) <- sequenceRest sequence
-                ev :: Event (g t) <- execute (commuteG <$> rest)
-                reactimate (fire <$> ev)
-                pure ev
-        pure (first', theRest, lag)
--}
 
 -- | A highly general variant of @switchE :: Event (Event t) -> Event t@.
 --
