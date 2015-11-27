@@ -26,16 +26,14 @@ Portability : non-portable (GHC only)
 {-# LANGUAGE UndecidableInstances #-}
 
 module Reactive.Sequence (
-      SequenceM
-    , runSequenceM
-    , Sequence(..)
+      Sequence(..)
     , SValue
     , SEvent
     , SBehavior
     , sequenceTrans
     , (|>)
     , always
-    , nothing
+    , never
     , lag
     , lag'
     , sEventToSBehavior
@@ -58,16 +56,18 @@ module Reactive.Sequence (
     , UnionsTo
     , sequenceUnion'
     , (<||>)
-    , sequenceCommute
     , switchSequence
     , Switchable
     , SwitchesTo
     , switchSequence'
     , switch
     , sequenceReactimate
+    , sequenceExecute
+    , sequenceCommute
     , immediatelyAfter
     ) where
 
+import Control.Monad
 import Control.Monad.Fix
 import Control.Monad.IO.Class
 import Data.Void
@@ -75,8 +75,11 @@ import Data.Proxy
 import Data.Functor.Identity
 import Data.EitherBoth
 import Data.Semigroup
-import Reactive.Banana.Combinators
+import Reactive.Banana.Combinators hiding (never)
+import qualified Reactive.Banana.Combinators as Banana
 import Reactive.Banana.Frameworks
+import Data.IORef
+import System.IO.Unsafe
 
 immediatelyAfter :: Event t -> MomentIO (Event t)
 immediatelyAfter ev = do
@@ -84,21 +87,61 @@ immediatelyAfter ev = do
     reactimate (fire <$> ev)
     return ev'
 
--- | TODO use this instead of MomentIO in the sequence combinators. Useful to
---   identify a subset of MomentIO which can't do just anything (this is not
---   MonadIO, and its constructor is not exported).
-newtype SequenceM t = SequenceM {
-      outSequenceM :: MomentIO t
-    }
+-- | A cached MomentIO computation.
+data SequenceM t where
+    SequenceMLift :: IORef (Either t (MomentIO t)) -> SequenceM t
+    SequenceMPure :: t -> SequenceM t
+    SequenceMFmap :: (s -> t) -> SequenceM s -> SequenceM t
+    SequenceMBind :: SequenceM s -> (s -> SequenceM t) ->  SequenceM t
+    SequenceMFix :: (t -> SequenceM t) -> SequenceM t
 
-runSequenceM :: SequenceM t -> MomentIO t
-runSequenceM = outSequenceM
+-- | Make a MomentIO computation cached, so that it will run at most once, and
+--   subsequent calls will just obtain the value without side-effects.
+sequenceM :: MomentIO t -> SequenceM t
+sequenceM m = unsafePerformIO $ do
+    ref <- newIORef (Right m)
+    pure (SequenceMLift ref)
 
-deriving instance Functor SequenceM
-deriving instance Applicative SequenceM
-deriving instance Monad SequenceM
-deriving instance MonadFix SequenceM
-deriving instance MonadMoment SequenceM
+-- | Run a SequenceM in MomentIO. This is not thread-safe.
+runSequenceM :: forall t . SequenceM t -> MomentIO t
+runSequenceM term = case term of
+    SequenceMLift ref -> do
+        -- This should be fine. I don't believe Sequences will be forced
+        -- concurrently... there's no reason for it. Obviously could be wrong
+        -- though.
+        x <- liftIO $ readIORef ref
+        case x of
+            Left val -> pure val
+            Right uncomputed -> do
+                val <- uncomputed
+                liftIO $ writeIORef ref (Left val)
+                pure val
+    SequenceMPure t -> pure t
+    SequenceMFmap f m -> fmap f (runSequenceM m)
+    SequenceMBind m k -> runSequenceM m >>= runSequenceM . k
+    SequenceMFix knot -> let untied :: t -> MomentIO t
+                             untied = fmap runSequenceM knot
+                         in  mfix untied
+
+instance Functor SequenceM where
+    fmap = SequenceMFmap
+
+instance Applicative SequenceM where
+    pure = SequenceMPure
+    (<*>) = ap
+
+instance Monad SequenceM where
+    return = pure
+    (>>=) = SequenceMBind
+
+instance MonadFix SequenceM where
+    mfix = SequenceMFix
+
+instance MonadIO SequenceM where
+    liftIO = sequenceM . liftIO
+
+instance MonadMoment SequenceM where
+    liftMoment = sequenceM . liftMoment
 
 -- | A @Sequence@ is like an @Event@, and also like a @Behavior@. It's
 --   one functorial value, followed by an @Event@ bringing more functorial
@@ -111,16 +154,23 @@ deriving instance MonadMoment SequenceM
 --     @
 --
 data Sequence (f :: * -> *) (g :: * -> *) (t :: *) where
+    -- | Holds, in order, the initial value, the remaining values, and
+    --   the remaining values lagged one frame, to allow for recursive
+    --   possibilities.
+    --   The whole thing is in a SequenceM because we need that in order to
+    --   produce the lagged event. The internal SequenceM is there so that
+    --   we don't necessarily have to force the remaining events just to
+    --   work with a sequence's internal parts.
     Sequence
-        :: MomentIO ( f s                      -- Initial value
-                    , MomentIO (Event (g s))   -- Remaining values
-                    , Event (g s)              -- Remaining values, lagged one frame
-                    )
-        -> (s -> t)
+        :: SequenceM (f t, SequenceM (Event (g t)), Event (g t))
         -> Sequence f g t
 
-instance Functor (Sequence f g) where
-    fmap f (Sequence m g) = Sequence m (fmap f g)
+instance (Functor f, Functor g) => Functor (Sequence f g) where
+    fmap f (Sequence m) = Sequence (fmap f' m)
+      where
+        f' (immediate, remaining, lagged) = ( (fmap) f immediate
+                                            , (fmap . fmap . fmap) f remaining
+                                            , (fmap . fmap) f lagged)
 
 -- | A @Sequence@ with no values coming from an @Event@.
 type SValue = Sequence Identity (Const Void)
@@ -133,128 +183,96 @@ type SEvent = Sequence (Const ()) Identity
 --   contains enough information to produce a @Behavior@.
 type SBehavior = Sequence Identity Identity
 
+sequenceFirst :: forall f g t . Functor f => Sequence f g t -> MomentIO (f t)
+sequenceFirst (Sequence m)  = do
+    (first, _, _) <- runSequenceM m
+    pure first
+
+sequenceRest :: forall f g t . Functor g => Sequence f g t -> MomentIO (Event (g t))
+sequenceRest (Sequence m) = do
+    (_, rest, _) <- runSequenceM m
+    runSequenceM rest
+
+sequenceLag :: forall f g t . Functor g => Sequence f g t -> MomentIO (Event (g t))
+sequenceLag (Sequence m) = do
+    (_, _, ev) <- runSequenceM m
+    pure ev
+
+always :: forall t . t -> SBehavior t
+always x = Sequence (pure (pure x, pure Banana.never, Banana.never))
+
+never :: forall t . SEvent t
+never = Sequence (pure (Const (), pure Banana.never, Banana.never))
+
 -- | Analogous to @stepper@.
-(|>) :: t -> SEvent t -> SequenceM (SBehavior t)
+sEventToSBehavior :: forall t . t -> SEvent t -> SBehavior t
+sEventToSBehavior t sevent = Sequence . sequenceM $ do
+    (lagged, fire) <- newEvent
+    let theRest :: SequenceM (Event (Identity t))
+        theRest = sequenceM $ do
+            rest <- sequenceRest sevent
+            reactimate (fire <$> rest)
+            return rest
+    pure (Identity t, theRest, lagged)
+
+-- | Alias for @sEventToSBehavior@
+(|>) :: t -> SEvent t -> SBehavior t
 (|>) = sEventToSBehavior
-
-always :: Applicative f => t -> Sequence f g t
-always x = Sequence (pure (pure x, pure never, never)) id
-
-nothing :: Sequence (Const ()) (Const Void) t
-nothing = Sequence (pure (Const (), pure never, never)) id
-
-sequenceFirst :: Functor f => Sequence f g t -> MomentIO (f t)
-sequenceFirst (Sequence m f) = do
-    (first, _, _) <- m
-    pure (f <$> first)
-
-sequenceRest :: Functor g => Sequence f g t -> MomentIO (Event (g t))
-sequenceRest (Sequence m f) = do
-    (_, rest, _) <- m
-    ev <- rest
-    return ((fmap . fmap) f ev)
-
-sequenceLag :: Functor g => Sequence f g t -> MomentIO (Event (g t))
-sequenceLag (Sequence m f) = do
-    (_, _, ev) <- m
-    pure ((fmap . fmap) f ev)
 
 -- | Take the lag of some behavior, giving a new behavior. They have the
 --   same initial value, but the changes to the output happen immediately after
 --   the changes to the input. Forcing the changes to the output does not
 --   force the changes to the input.
-lag :: (Functor f, Functor g) => Sequence f g t -> SequenceM (Sequence f g t)
-lag sequence = SequenceM $ do
+--
+--   NB this does not touch the rest of the sequence, only its immediate part
+--   and its lag. If the rest is never forced, then the rest of this
+--   will never fire.
+lag :: forall f g t . (Functor f, Functor g) => Sequence f g t -> Sequence f g t
+lag sequence = Sequence . sequenceM $ do
     first <- sequenceFirst sequence
     rest <- sequenceLag sequence
     (lag, fire) <- newEvent
     reactimate (fire <$> rest)
-    pure (Sequence (pure (first, pure rest, lag)) id)
+    pure (first, pure rest, lag)
 
 -- | Like @lag@, but stricter: forcing its changes *will* force the changes to
 --   the thing from which it's derived. Useful if you want to get an event
 --   immediately after another, whereas @lag@ is more useful in case you want
 --   to do some recursion.
-lag' :: (Functor f, Functor g) => Sequence f g t -> SequenceM (Sequence f g t)
-lag' sequence = SequenceM $ do
+lag' :: forall f g t . (Functor f, Functor g) => Sequence f g t -> Sequence f g t
+lag' sequence = Sequence . sequenceM $ do
     first <- sequenceFirst sequence
     rest <- sequenceRest sequence
     lag <- sequenceLag sequence
     rest' <- immediatelyAfter rest
     lag' <- immediatelyAfter lag
-    pure (Sequence (pure (first, pure rest', lag')) id)
+    pure (first, pure rest', lag')
 
-{-
-sBehaviorLag :: SBehavior t -> SequenceM (SBehavior t)
-sBehaviorLag sequence = SequenceM $ do
-    first <- sequenceFirst sequence
-    rest <- sequenceLag sequence
-    (lag, fire) <- newEvent
-    reactimate (fire <$> rest)
-    pure (Sequence (pure (first, pure rest, lag)) id)
--}
-
--- | Analogous to @stepper@.
-sEventToSBehavior :: t -> SEvent t -> SequenceM (SBehavior t)
-sEventToSBehavior t sevent = SequenceM $ do
-    (lag, fire) <- newEvent
-    let theRest = do
-            rest <- sequenceRest sevent
-            reactimate (fire <$> rest)
-            return rest
-    pure (Sequence (pure (Identity t, theRest, lag)) id)
-
--- What are the implications of dumping the monadic part inside the derived
--- sequence? Every time you ask for the first or rest you get a new lag
--- event. Maybe that's ok?
-{-
-sEventToSBehavior :: t -> SEvent t -> SBehavior t
-sEventToSBehavior t sevent = Sequence content id
-  where
-    content = do
-        (lag, fire) <- newEvent
-        let theRest = do
-                rest <- sequenceRest sevent
-                reactimate (fire <$> rest)
-                return rest
-        pure (Identity t, theRest, lag)
--}
 
 -- | @SEvent@ is at least as big as @Event@.
-eventToSEvent :: Event t -> SequenceM (SEvent t)
-eventToSEvent ev = SequenceM $ do
-    lag <- immediatelyAfter ev
-    pure (Sequence (pure (Const (), pure (Identity <$> ev), Identity <$> lag)) id)
-{-
--- Does this make a difference compared to the current one? Maybe we should
--- prefer it?
 eventToSEvent :: Event t -> SEvent t
-eventToSEvent ev = Sequence content id
-  where
-    content = do
-        lag <- immediatelyAfter ev
-        pure (Const (), pure (Identity <$> ev), Identity <$> lag)
--}
+eventToSEvent ev = Sequence . sequenceM $ do
+    lagged <- immediatelyAfter ev
+    pure (Const (), pure (Identity <$> ev), Identity <$> lagged)
 
 -- | An @Event@ can be recovered from any @SEvent@.
-sEventToEvent :: SEvent t -> SequenceM (Event t)
-sEventToEvent sevent = SequenceM $ (fmap . fmap) runIdentity (sequenceRest sevent)
+sEventToEvent :: SEvent t -> MomentIO (Event t)
+sEventToEvent sevent = (fmap . fmap) runIdentity (sequenceRest sevent)
 
 -- | A @Behavior@ can be recovered from any @SBehavior@.
-sBehaviorToBehavior :: SBehavior t -> SequenceM (Behavior t)
-sBehaviorToBehavior sbehavior = SequenceM $ do
+sBehaviorToBehavior :: SBehavior t -> MomentIO (Behavior t)
+sBehaviorToBehavior sbehavior = do
     initial :: Identity t <- sequenceFirst sbehavior
     rest :: Event (Identity t) <- sequenceRest sbehavior
     b <- stepper initial rest
     return (runIdentity <$> b)
 
--- | The changes to an @SBehavior@.
+-- | Drop the first value to obtain only the changes.
 sBehaviorToSEvent :: SBehavior t -> SEvent t
-sBehaviorToSEvent sbehavior = Sequence content id
-  where
-    content = do
-        lag <- sequenceLag sbehavior
-        pure (Const (), sequenceRest sbehavior, lag)
+sBehaviorToSEvent sbehavior = Sequence . sequenceM $ do
+    lagged <- sequenceLag sbehavior
+    rest <- sequenceRest sbehavior
+    pure (Const (), pure rest, lagged)
 
 sequenceTrans
     :: forall f1 f2 g1 g2 t .
@@ -262,33 +280,15 @@ sequenceTrans
     -> (forall a . g1 a -> g2 a)
     -> Sequence f1 g1 t
     -> Sequence f2 g2 t
-sequenceTrans transF transG (Sequence content h) = Sequence (alter <$> content) h
+sequenceTrans transF transG (Sequence content) = Sequence (alter <$> content)
   where
     alter
         :: forall s .
-           (f1 s, MomentIO (Event (g1 s)), Event (g1 s))
-        -> (f2 s, MomentIO (Event (g2 s)), Event (g2 s))
+           (f1 s, SequenceM (Event (g1 s)), Event (g1 s))
+        -> (f2 s, SequenceM (Event (g2 s)), Event (g2 s))
     alter (s, rest, lag) = (transF s, (fmap . fmap) transG rest, fmap transG lag)
 
--- | @Sequence@s with homogeneous functor parameters are applicatives.
---   A more general applicative-style interface is given by
---
---     @
---       always :: f t -> Sequence f g t
---       (<%>) :: Sequence f1 g1 (s -> t) -> Sequence f2 g2 s -> Sequence f3 g3 t
---     @
---
---   Note that for (<%>) we rely on the Bundleable type class to determine
---   what the output parameters @f3@ and @g3@ shall be. This allows us to
---   combine SEvent and SBehavior, for example, to get an SEvent.
-instance
-    ( Applicative f
-    , Applicative (BundleableIntermediate f f f f)
-    , Bundleable f f f f
-    , BundleableOutputF f f f f ~ f
-    , BundleableOutputG f f f f ~ f
-    ) => Applicative (Sequence f f)
-  where
+instance Applicative SBehavior where
     pure = always
     (<*>) = (<%>)
 
@@ -334,6 +334,7 @@ bundle
     -> Sequence f1 g1 s
     -> Sequence f2 g2 t
     -> Sequence f3 g3 (s, t)
+
 bundle transF1
        transF2
        transG1
@@ -345,26 +346,24 @@ bundle transF1
        outH
        left
        right
-   = Sequence content id
+   = Sequence . sequenceM $ do
+         firstl :: f1 s <- sequenceFirst left
+         firstr :: f2 t <- sequenceFirst right
+         lagl :: Event (g1 s) <- sequenceLag left
+         lagr :: Event (g2 t) <- sequenceLag right
+         lag <- bundleEvents (firstl, lagl) (firstr, lagr)
+         let theRest :: SequenceM (Event (g3 (s, t)))
+             theRest = sequenceM $ do
+                 restl :: Event (g1 s) <- sequenceRest left
+                 restr :: Event (g2 t) <- sequenceRest right
+                 bundleEvents (firstl, restl) (firstr, restr)
+
+         pure ( (,) <$> transF1 firstl <*> transF2 firstr
+              , theRest
+              , lag
+              )
+
   where
-
-    content :: MomentIO (f3 (s, t), MomentIO (Event (g3 (s, t))), Event (g3 (s, t)))
-    content = do 
-       firstl :: f1 s <- sequenceFirst left
-       firstr :: f2 t <- sequenceFirst right
-       lagl :: Event (g1 s) <- sequenceLag left
-       lagr :: Event (g2 t) <- sequenceLag right
-       lag <- bundleEvents (firstl, lagl) (firstr, lagr)
-       let theRest :: MomentIO (Event (g3 (s, t)))
-           theRest = do
-               restl :: Event (g1 s) <- sequenceRest left
-               restr :: Event (g2 t) <- sequenceRest right
-               bundleEvents (firstl, restl) (firstr, restr)
-
-       pure ( (,) <$> transF1 firstl <*> transF2 firstr
-            , theRest
-            , lag
-            )
 
     bundleEvents :: (f1 s, Event (g1 s)) -> (f2 t, Event (g2 t)) -> MomentIO (Event (g3 (s, t)))
     bundleEvents (firstl, restl) (firstr, restr) = do
@@ -653,15 +652,16 @@ infixl 4 <%
     -> Sequence (BundleableOutputF f1 f2 g1 g2) (BundleableOutputG f1 f2 g1 g2) t
 left <% right = (uncurry ($)) <$> (bundleRight' left right)
 
--- | Define an SBehavior in terms of its own Behavior
-fixSBehavior
-    :: forall t .
-       ( SBehavior t -> SequenceM (SBehavior t) )
-    -> SequenceM (SBehavior t)
-fixSBehavior makeIt = mdo
-    sbehavior <- makeIt lagged
-    lagged <- lag sbehavior
-    pure sbehavior
+-- | Define an SBehavior in terms of itself.
+fixSBehavior :: forall t . (SBehavior t -> SBehavior t) -> SBehavior t
+fixSBehavior makeIt = Sequence . sequenceM $ mdo
+    let sbehavior = makeIt laggedSelf
+    -- Important that we use lag not lag'.
+    let laggedSelf = lag sbehavior
+    first <- sequenceFirst sbehavior
+    lagged <- sequenceLag sbehavior
+    rest <- sequenceRest sbehavior
+    pure (first, pure rest, lagged)
 
 -- | Sort of like @<|>@, as @<%>@ is for @<*>@. This combinator gives the
 --   @Sequence@ of the *latest* values for both input @Sequence@s, subject
@@ -688,21 +688,31 @@ sequenceUnion
     -> Sequence f1 g1 s
     -> Sequence f2 g2 s
     -> Sequence f3 g3 s
-sequenceUnion disambiguator disambiguatorF disambiguatorG transG1 transG2 left right = Sequence content id
-  where
-    content = do
-        firstl :: f1 s <- sequenceFirst left
-        firstr :: f2 s <- sequenceFirst right
-        lagl :: Event (g1 s) <- sequenceLag left
-        lagr :: Event (g2 s) <- sequenceLag right
-        let theRest = do
-                restl :: Event (g1 s) <- sequenceRest left
-                restr :: Event (g2 s) <- sequenceRest right
-                return (unionWith (disambiguatorG disambiguator) (transG1 <$> restl) (transG2 <$> restr))
-        pure ( disambiguatorF disambiguator firstl firstr
-             , theRest
-             , unionWith (disambiguatorG disambiguator) (transG1 <$> lagl) (transG2 <$> lagr)
-             )
+sequenceUnion disambiguator
+              disambiguatorF
+              disambiguatorG
+              transG1
+              transG2
+              left
+              right
+    = Sequence . sequenceM $ do
+          firstl :: f1 s <- sequenceFirst left
+          firstr :: f2 s <- sequenceFirst right
+          lagl :: Event (g1 s) <- sequenceLag left
+          lagr :: Event (g2 s) <- sequenceLag right
+          let theRest = sequenceM $ do
+                  restl :: Event (g1 s) <- sequenceRest left
+                  restr :: Event (g2 s) <- sequenceRest right
+                  pure (unionWith (disambiguatorG disambiguator)
+                                  (transG1 <$> restl)
+                                  (transG2 <$> restr)
+                       )
+          pure ( disambiguatorF disambiguator firstl firstr
+               , theRest
+               , unionWith (disambiguatorG disambiguator)
+                           (transG1 <$> lagl)
+                           (transG2 <$> lagr)
+               )
 
 class
     ( Applicative f1
@@ -812,23 +822,6 @@ infixl 4 <||>
     -> Sequence (UnionOutputF f1 f2 g1 g2) (UnionOutputG f1 f2 g1 g2) s
 (<||>) = sequenceUnion' (<>)
 
--- | Commute a Sequence with MomentIO. This will force the first and rest of
---   the sequence.
-sequenceCommute
-    :: forall f g t .
-       ( Functor f, Functor g )
-    => (forall s . f (MomentIO s) -> MomentIO (f s))
-    -> (forall s . g (MomentIO s) -> MomentIO (g s))
-    -> Sequence f g (MomentIO t)
-    -> SequenceM (Sequence f g t)
-sequenceCommute commuteF commuteG sequence = SequenceM $ do
-    first :: f (MomentIO t) <- sequenceFirst sequence
-    rest :: Event (g (MomentIO t)) <- sequenceRest sequence
-    executedFirst <- commuteF first
-    executedRest <- execute (commuteG <$> rest)
-    (lag, fire) <- newEvent
-    reactimate (fire <$> executedRest)
-    pure (Sequence (pure (executedFirst, pure executedRest, lag)) id)
 
 -- | A highly general variant of @switchE :: Event (Event t) -> Event t@.
 --
@@ -858,7 +851,7 @@ switchSequence
     -> (forall t . g1 (Event (g2 t)) -> Event (g3 t))
     -> (g3 t -> g3 t -> g3 t)
     -> Sequence f1 g1 (Sequence f2 g2 t)
-    -> SequenceM (Sequence f3 g3 t)
+    -> Sequence f3 g3 t
 switchSequence commuteF1
                commuteG1
                joinF1F2
@@ -867,7 +860,7 @@ switchSequence commuteF1
                eventG1
                disambiguatorG3
                sequence
-    = SequenceM $ do 
+    = Sequence . sequenceM $ do 
           -- To get the first part, we take the first part of the outer
           -- @Sequence@, which is itself a @Sequenc@e, but guarded by @f1@.
           first :: f1 (Sequence f2 g2 t) <- sequenceFirst sequence
@@ -879,38 +872,37 @@ switchSequence commuteF1
           -- value of the switched @Sequence@.
           first' :: f1 (f2 t) <- commuteF1 (sequenceFirst <$> first)
 
-          -- TBD does it matter whether we do the following computation here,
-          -- or wrap it up in a MomentIO are throw it into the second place of
-          -- the resulting sequence?
-
-          -- The remaining @Sequence@s in the outer @Sequence@.
-          rest :: Event (g1 (Sequence f2 g2 t)) <- sequenceRest sequence
-          -- The remaining elements of the first part of the outer
-          -- @Sequence@.
-          firstRest :: f1 (Event (g2 t))
-              <- commuteF1 (sequenceRest <$> first)
-          -- The first (immediate) elements of the remaining sequences.
-          restFirst :: Event (g1 (f2 t))
-              <- execute ((commuteG1 . fmap sequenceFirst) <$> rest)
-          -- The remaining elements of the remaining sequences.
-          restRest :: Event (g1 (Event (g2 t)))
-              <- execute ((commuteG1 . fmap sequenceRest) <$> rest)
-          let switchedRest :: Event (g3 t)
-              switchedRest = switchE (eventG1 <$> restRest)
-          -- We want to use firstRest until restFirst has fired at least
-          -- once, at which point we union restFirst with restRest.
-          restHasFired :: Behavior Bool <- stepper False (const True <$> restFirst)
-          let remaining :: Event (g3 t)
-              remaining = unionWith disambiguatorG3
-                                    (eventG1F2 restFirst)
-                                    (switchedRest)
-          let ev = unionWith disambiguatorG3
-                             (filterApply ((const . not) <$> restHasFired) (eventF1 firstRest))
-                             (filterApply (const <$> restHasFired) remaining)
           (lag, fire) <- newEvent
-          reactimate (fire <$> ev)
 
-          return (Sequence (pure (joinF1F2 first', pure ev, lag)) id)
+          let theRest = sequenceM $ do
+                  -- The remaining @Sequence@s in the outer @Sequence@.
+                  rest :: Event (g1 (Sequence f2 g2 t)) <- sequenceRest sequence
+                  -- The remaining elements of the first part of the outer
+                  -- @Sequence@.
+                  firstRest :: f1 (Event (g2 t))
+                      <- commuteF1 (sequenceRest <$> first)
+                  -- The first (immediate) elements of the remaining sequences.
+                  restFirst :: Event (g1 (f2 t))
+                      <- execute ((commuteG1 . fmap sequenceFirst) <$> rest)
+                  -- The remaining elements of the remaining sequences.
+                  restRest :: Event (g1 (Event (g2 t)))
+                      <- execute ((commuteG1 . fmap sequenceRest) <$> rest)
+                  let switchedRest :: Event (g3 t)
+                      switchedRest = switchE (eventG1 <$> restRest)
+                  -- We want to use firstRest until restFirst has fired at least
+                  -- once, at which point we union restFirst with restRest.
+                  restHasFired :: Behavior Bool <- stepper False (const True <$> restFirst)
+                  let remaining :: Event (g3 t)
+                      remaining = unionWith disambiguatorG3
+                                            (eventG1F2 restFirst)
+                                            (switchedRest)
+                  let ev = unionWith disambiguatorG3
+                                     (filterApply ((const . not) <$> restHasFired) (eventF1 firstRest))
+                                     (filterApply (const <$> restHasFired) remaining)
+                  reactimate (fire <$> ev)
+                  pure ev
+
+          pure (joinF1F2 first', theRest, lag)
 
 class Switchable f1 f2 g1 g2 where
     type SwitchableOutputF f1 f2 g1 g2 :: * -> *
@@ -949,7 +941,7 @@ instance Switchable (Const ()) Identity Identity Identity where
     switchableCommuteF _ = const (pure (Const ()))
     switchableCommuteG _ = fmap Identity . runIdentity
     switchableJoinF _ = const (Const ())
-    switchableJoinEventF _ = const never
+    switchableJoinEventF _ = const Banana.never
     switchableJoinEventFG _ = fmap runIdentity
     switchableJoinEventG _ = runIdentity
     switchableDisambiguator _ disambiguator l r = disambiguator <$> l <*> r
@@ -964,7 +956,7 @@ instance Switchable Identity (Const ()) Identity Identity where
     switchableJoinEventF _ = runIdentity
     -- forall a . Identity (Const () t) -> Identity t
     -- is not possible, so we give never.
-    switchableJoinEventFG _ = const never
+    switchableJoinEventFG _ = const Banana.never
     switchableJoinEventG _ = runIdentity
     switchableDisambiguator _ disambiguator l r = disambiguator <$> l <*> r
 
@@ -974,8 +966,8 @@ instance Switchable (Const ()) (Const ()) Identity Identity where
     switchableCommuteF _ = const (pure (Const ()))
     switchableCommuteG _ = fmap Identity . runIdentity
     switchableJoinF _ = const (Const ())
-    switchableJoinEventF _ = const never
-    switchableJoinEventFG _ = const never
+    switchableJoinEventF _ = const Banana.never
+    switchableJoinEventFG _ = const Banana.never
     switchableJoinEventG _ = runIdentity
     switchableDisambiguator _ disambiguator l r = disambiguator <$> l <*> r
 
@@ -1007,7 +999,7 @@ switchSequence'
        )
     => (t -> t -> t)
     -> Sequence f1 g1 (Sequence f2 g2 t)
-    -> SequenceM (Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t)
+    -> Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t
 switchSequence' disambiguator = switchSequence (switchableCommuteF proxy)
                                                (switchableCommuteG proxy)
                                                (switchableJoinF proxy)
@@ -1032,7 +1024,7 @@ switch
        )
     => (t -> t -> t)
     -> Sequence f1 g1 (Sequence f2 g2 t)
-    -> SequenceM (Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t)
+    -> Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t
 switch = switchSequence'
 
 sequenceReactimate
@@ -1041,10 +1033,47 @@ sequenceReactimate
     => (f (IO ()) -> IO ())
     -> (g (IO ()) -> IO ())
     -> Sequence f g (IO ())
-    -> SequenceM ()
-sequenceReactimate elimF elimG sequence = SequenceM $ do
+    -> MomentIO ()
+sequenceReactimate elimF elimG sequence = do
     first :: f (IO ()) <- sequenceFirst sequence
     rest :: Event (g (IO ())) <- sequenceRest sequence
     liftIO (elimF first)
     reactimate (elimG <$> rest)
     return ()
+
+-- | Execute a Sequence, analogous to reactive-banana execute.
+--   This will force the first and rest of the sequence.
+sequenceExecute
+    :: forall f g t .
+       ( Functor f, Functor g )
+    => (forall s . f (MomentIO s) -> MomentIO (f s))
+    -> (forall s . g (MomentIO s) -> MomentIO (g s))
+    -> Sequence f g (MomentIO t)
+    -> MomentIO (Sequence f g t)
+sequenceExecute commuteF commuteG sequence = do
+    first <- sequenceFirst sequence
+    rest <- sequenceRest sequence
+    executedFirst <- commuteF first
+    executedRest <- execute (commuteG <$> rest)
+    (lag, fire) <- newEvent
+    reactimate (fire <$> executedRest)
+    pure (Sequence (pure (executedFirst, pure executedRest, lag)))
+
+-- | Like sequenceExecute, except that the execution is performed on-demand.
+--   It does precisely the same thing as sequenceExecute, but the effects are
+--   realized only when the sequence is forced.
+sequenceCommute
+    :: forall f g t .
+       ( Functor f, Functor g )
+    => (forall s . f (MomentIO s) -> MomentIO (f s))
+    -> (forall s . g (MomentIO s) -> MomentIO (g s))
+    -> Sequence f g (MomentIO t)
+    -> Sequence f g t
+sequenceCommute commuteF commuteG sequence = Sequence . sequenceM $ do
+    first :: f (MomentIO t) <- sequenceFirst sequence
+    rest :: Event (g (MomentIO t)) <- sequenceRest sequence
+    executedFirst <- commuteF first
+    executedRest <- execute (commuteG <$> rest)
+    (lag, fire) <- newEvent
+    reactimate (fire <$> executedRest)
+    pure (executedFirst, pure executedRest, lag)

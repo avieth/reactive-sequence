@@ -36,8 +36,8 @@ main = do
             let union1 :: SEvent String
                 union1 = ev1 <||> ev2 <||> ev3
 
-            be1 :: SBehavior String
-                <- runSequenceM (sEventToSBehavior "Initial" ev1)
+            let be1 :: SBehavior String
+                be1 = "Initial" |> ev1
 
             -- If we introduce an SBehavior, then our union becomes an
             -- SBehavior: the initial value is simply the initial value of
@@ -45,9 +45,8 @@ main = do
             let union2 :: SBehavior String
                 union2 = be1 <||> ev2 <||> ev3
 
-            runSequenceM $ do
-                sequenceReactimate (const (pure ())) (runIdentity) (putStrLn <$> (((++) "Union 1: ") <$> union1))
-                sequenceReactimate (runIdentity) (runIdentity) (putStrLn <$> (((++) "Union 2: ") <$> union2))
+            sequenceReactimate (const (pure ())) (runIdentity) (putStrLn <$> (((++) "Union 1: ") <$> union1))
+            sequenceReactimate (runIdentity) (runIdentity) (putStrLn <$> (((++) "Union 2: ") <$> union2))
 
             liftIO $ writeIORef killThreads [kill1, kill2, kill3]
 

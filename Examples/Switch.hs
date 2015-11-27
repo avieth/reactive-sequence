@@ -39,13 +39,12 @@ main = do
             let ev :: SEvent (SEvent String)
                 ev = getFirst <$> ((First <$> ev3) <||> (First <$> ev4))
 
-            ev' :: SEvent String
-                <- runSequenceM $ switch const ev
+            let ev' :: SEvent String
+                ev' = switch const ev
 
-            runSequenceM $
-                sequenceReactimate (const (pure ()))
-                                   (runIdentity)
-                                   (putStrLn <$> (((++) "Event: ") <$> ev'))
+            sequenceReactimate (const (pure ()))
+                               (runIdentity)
+                               (putStrLn <$> (((++) "Event: ") <$> ev'))
 
             liftIO $ writeIORef killThreads [kill1, kill2, kill3, kill4]
 
