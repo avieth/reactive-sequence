@@ -33,7 +33,9 @@ module Reactive.Sequence (
     , sequenceTrans
     , (|>)
     , always
+    , always'
     , never
+    , never'
     , lag
     , lag'
     , sEventToSBehavior
@@ -61,9 +63,12 @@ module Reactive.Sequence (
     , SwitchesTo
     , switchSequence'
     , switch
+    , sequenceFilter
     , sequenceReactimate
     , sequenceExecute
     , sequenceCommute
+    , Commutable
+    , sequenceCommutor
     , immediatelyAfter
     ) where
 
@@ -199,10 +204,16 @@ sequenceLag (Sequence m) = do
     pure ev
 
 always :: forall t . t -> SBehavior t
-always x = Sequence (pure (pure x, pure Banana.never, Banana.never))
+always = always'
+
+always' :: forall t g . t -> Sequence Identity g t
+always' x = Sequence (pure (pure x, pure Banana.never, Banana.never))
 
 never :: forall t . SEvent t
-never = Sequence (pure (Const (), pure Banana.never, Banana.never))
+never = never'
+
+never' :: forall t g . Sequence (Const ()) g t
+never' = Sequence (pure (Const (), pure Banana.never, Banana.never))
 
 -- | Analogous to @stepper@.
 sEventToSBehavior :: forall t . t -> SEvent t -> SBehavior t
@@ -1027,6 +1038,22 @@ switch
     -> Sequence (SwitchableOutputF f1 f2 g1 g2) (SwitchableOutputG f1 f2 g1 g2) t
 switch = switchSequence'
 
+-- | Filter a sequence by identifying those things which you would like to
+--   keep. Must also give a way to commute @g@ with @Maybe@.
+sequenceFilter
+    :: forall g s t .
+       ( Functor g )
+    => (forall a . g (Maybe a) -> Maybe (g a))
+    -> (s -> Maybe t)
+    -> Sequence (Const ()) g s
+    -> Sequence (Const ()) g t
+sequenceFilter commuteG pick sequence = Sequence . sequenceM $ do
+    lagged <- sequenceLag sequence
+    let theRest = sequenceM $ do
+            rest <- sequenceRest sequence
+            pure (filterJust (fmap (commuteG . fmap pick) rest))
+    pure (Const (), theRest, filterJust (fmap (commuteG . fmap pick) lagged))
+
 sequenceReactimate
     :: forall f g .
        ( Functor f, Functor g )
@@ -1077,3 +1104,12 @@ sequenceCommute commuteF commuteG sequence = Sequence . sequenceM $ do
     (lag, fire) <- newEvent
     reactimate (fire <$> executedRest)
     pure (executedFirst, pure executedRest, lag)
+
+class Commutable f where
+    sequenceCommutor :: f (MomentIO s) -> MomentIO (f s)
+
+instance Commutable Identity where
+    sequenceCommutor = fmap Identity . runIdentity
+
+instance Commutable (Const ()) where
+    sequenceCommutor = const (pure (Const ()))
