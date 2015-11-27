@@ -40,12 +40,14 @@ module Reactive.Sequence (
     , lag'
     , sEventToSBehavior
     , sBehaviorToSEvent
+    , sequenceTrim
     , eventToSEvent
     , sEventToEvent
     , sBehaviorToBehavior
     , fixSBehavior
     , bundle
     , Bundleable
+    , BundlesTo
     , bundle'
     , bundleLeft'
     , bundleRight'
@@ -285,6 +287,16 @@ sBehaviorToSEvent sbehavior = Sequence . sequenceM $ do
     rest <- sequenceRest sbehavior
     pure (Const (), pure rest, lagged)
 
+-- | Does not force the first of the input sequence, just drops it.
+sequenceTrim :: (Functor g) => Sequence f g t -> Sequence (Const ()) g t
+sequenceTrim sbehavior = Sequence . sequenceM $ do
+    (lagged, fire) <- newEvent
+    let theRest = sequenceM $ do
+            rest <- sequenceRest sbehavior
+            reactimate (fire <$> rest)
+            pure rest
+    pure (Const (), theRest, lagged)
+
 sequenceTrans
     :: forall f1 f2 g1 g2 t .
        (forall a . f1 a -> f2 a)
@@ -408,7 +420,16 @@ bundle transF1
                     Right s' -> (\l r -> (,) <$> l <*> r) <$> pure s' <*> transG2 t
         return (filterJust (pick <$> evLR'))
 
-class Bundleable (f1 :: * -> *) (f2 :: * -> *) (g1 :: * -> *) (g2 :: * -> *) where
+class
+    ( Applicative f1
+    , Applicative f2
+    , Applicative g1
+    , Applicative g2
+    , Applicative (BundleableOutputF f1 f2 g1 g2)
+    , Applicative (BundleableOutputG f1 f2 g1 g2)
+    , Applicative (BundleableIntermediate f1 f2 g1 g2)
+    ) => Bundleable (f1 :: * -> *) (f2 :: * -> *) (g1 :: * -> *) (g2 :: * -> *)
+  where
     type BundleableOutputF f1 f2 g1 g2 :: * -> *
     type BundleableOutputG f1 f2 g1 g2 :: * -> *
     type BundleableIntermediate f1 f2 g1 g2 :: * -> *
@@ -502,6 +523,9 @@ instance Bundleable Identity Identity Identity Identity where
     -- Has we chosen Left, the bundled behavior would never update.
     bundleIntermediateOut _ = Right
 
+type family BundlesTo s1 s2 :: * -> * where
+    BundlesTo (Sequence f1 g1) (Sequence f2 g2) = Sequence (BundleableOutputF f1 f2 g1 g2)
+                                                           (BundleableOutputG f1 f2 g1 g2)
 -- | Like @bundle@, but with the parameters filled in automatically via the
 --   @Bundleable@ class.
 bundle'
