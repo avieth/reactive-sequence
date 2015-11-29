@@ -53,10 +53,18 @@ main = do
             -- Notice that when we reactimate the SEvent, we can give
             -- const (pure ()) for the first argument, meaning no IO will
             -- happen immediately, as there is no initial value.
-            sequenceReactimate (const (pure ())) (runIdentity) (print <$> ((,) "Event" <$> bundle1))
+            sequenceReactimate (const (pure (Const ())))
+                               (fmap Identity . runIdentity)
+                               (const ())
+                               (runIdentity)
+                               (print <$> ((,) "Event" <$> bundle1))
             -- This will fire *many* times before the above reactimate,
             -- for every event of ev1, ev2, or ev3 causes it to run.
-            sequenceReactimate (runIdentity) (runIdentity) (print <$> ((,) "Behavior" <$> bundle2))
+            sequenceReactimate (fmap Identity . runIdentity)
+                               (fmap Identity . runIdentity)
+                               (runIdentity)
+                               (runIdentity)
+                               (print <$> ((,) "Behavior" <$> bundle2))
 
             liftIO $ writeIORef killThreads [kill1, kill2, kill3]
 

@@ -42,7 +42,9 @@ main = do
             let ev' :: SEvent String
                 ev' = switch const ev
 
-            sequenceReactimate (const (pure ()))
+            sequenceReactimate (const (pure (Const ())))
+                               (fmap Identity . runIdentity)
+                               (const ())
                                (runIdentity)
                                (putStrLn <$> (((++) "Event: ") <$> ev'))
 

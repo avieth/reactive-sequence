@@ -1081,15 +1081,17 @@ sequenceFilter commuteG pick sequence = Sequence . sequenceM $ do
 sequenceReactimate
     :: forall f g .
        ( Functor f, Functor g )
-    => (f (IO ()) -> IO ())
-    -> (g (IO ()) -> IO ())
+    => (forall s . f (IO s) -> IO (f s))
+    -> (forall s . g (IO s) -> IO (g s))
+    -> (f () -> ())
+    -> (g () -> ())
     -> Sequence f g (IO ())
     -> MomentIO ()
-sequenceReactimate elimF elimG sequence = do
+sequenceReactimate commuteF commuteG elimF elimG sequence = do
     first :: f (IO ()) <- sequenceFirst sequence
     rest :: Event (g (IO ())) <- sequenceRest sequence
-    liftIO (elimF first)
-    reactimate (elimG <$> rest)
+    liftIO (elimF <$> commuteF first)
+    reactimate (fmap elimG . commuteG <$> rest)
     return ()
 
 -- | Execute a Sequence, analogous to reactive-banana execute.

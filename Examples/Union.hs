@@ -45,8 +45,17 @@ main = do
             let union2 :: SBehavior String
                 union2 = be1 <||> ev2 <||> ev3
 
-            sequenceReactimate (const (pure ())) (runIdentity) (putStrLn <$> (((++) "Union 1: ") <$> union1))
-            sequenceReactimate (runIdentity) (runIdentity) (putStrLn <$> (((++) "Union 2: ") <$> union2))
+            sequenceReactimate (const (pure (Const ())))
+                               (fmap Identity . runIdentity)
+                               (const ())
+                               (runIdentity)
+                               (putStrLn <$> (((++) "Union 1: ") <$> union1))
+
+            sequenceReactimate (fmap Identity . runIdentity)
+                               (fmap Identity . runIdentity)
+                               (runIdentity)
+                               (runIdentity)
+                               (putStrLn <$> (((++) "Union 2: ") <$> union2))
 
             liftIO $ writeIORef killThreads [kill1, kill2, kill3]
 

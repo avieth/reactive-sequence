@@ -46,7 +46,9 @@ main = do
             let bundle1 :: SEvent ((), Int, String)
                 bundle1 = (,,) <$> ev1 <% ev2 <% ev3
 
-            sequenceReactimate (const (pure ()))
+            sequenceReactimate (const (pure (Const ())))
+                               (fmap Identity . runIdentity)
+                               (const ())
                                (runIdentity)
                                (print <$> ((,) "Event 1" <$> bundle1))
 
@@ -57,7 +59,9 @@ main = do
             let bundle2 :: SEvent ((), Int)
                 bundle2 = (,) <$> ev1 %> ev2
 
-            sequenceReactimate (const (pure ()))
+            sequenceReactimate (const (pure (Const ())))
+                               (fmap Identity . runIdentity)
+                               (const ())
                                (runIdentity)
                                (print <$> ((,) "Event 2" <$> bundle2))
 
