@@ -53,24 +53,6 @@ mkOnce uncomputed = unsafePerformIO $ do
 once :: MonadIO f => f t -> f t
 once = runOnce . mkOnce
 
-{-
-newtype Promise t = Promise {
-      runPromise :: Maybe t
-    }
-
-deriving instance Show t => Show (Promise t)
-deriving instance Functor Promise
-deriving instance Applicative Promise
-deriving instance Alternative Promise
-deriving instance Monad Promise
-
-present :: t -> Promise t
-present = Promise . Just
-
-notPresent :: Promise t
-notPresent = Promise Nothing
--}
-
 -- | Use this type to compute applicatively with reactive-banana events.
 newtype Sequence t = Sequence {
       getSequence :: MomentIO (t, Event t)
@@ -83,7 +65,7 @@ revent ev = Compose . Sequence $ do
     ev' = Just <$> ev
 
 behavior :: Sequence t -> MomentIO (Behavior t, Event t)
-behavior seqnc = do
+behavior seqnc = once $ do
     (first, rest) <- runSequence seqnc
     b <- stepper first rest
     pure (b, rest)
@@ -129,16 +111,23 @@ runSequence = getSequence
 --   the Sequence is emitted, and its remaining elements follow until the
 --   event fires again.
 sequenceSwitch' :: forall t . Event t -> Event (Sequence t) -> MomentIO (Event t)
-sequenceSwitch' first ev = mdo
+sequenceSwitch' first ev = once $ do
+    secondHasFired :: Behavior Bool <- stepper False (const True <$> ev)
     let controlledFirst :: Event t
         controlledFirst = whenE (not <$> secondHasFired) first
-    secondHasFired :: Behavior Bool <- stepper False (const True <$> ev)
     executed :: Event (t, Event t) <- execute (runSequence <$> ev)
+    {-
     let firsts :: Event t
-        firsts = unionWith const controlledFirst (fst <$> executed)
+        firsts = unionWith const (fst <$> executed) controlledFirst 
     let rests :: Event t
         rests = switchE (snd <$> executed)
     pure (unionWith const firsts rests)
+    -}
+    let bundle :: forall t . Event (t, Event t) -> Event t
+        bundle ev = unionWith const (switchE (snd <$> ev)) (fst <$> ev)
+    let bundled :: Event t
+        bundled = bundle executed
+    pure (unionWith const bundled controlledFirst)
 
 -- | This is like sequenceSwitch' but we have to account for the initial
 --   sequence. How?! How to determine when to ditch the initial sequence's
@@ -172,7 +161,7 @@ sequenceSwitchE seqnc = do
         first = whenE (not <$> restHasFired) firstEv
     let rest :: Event t
         rest = switchE restEv
-    pure (unionWith const first rest)
+    pure (unionWith const rest first)
 
 sequenceReactimate :: Sequence (IO ()) -> MomentIO ()
 sequenceReactimate seqnc = do
@@ -181,7 +170,7 @@ sequenceReactimate seqnc = do
     reactimate rest
 
 sequenceCommute :: Sequence (MomentIO t) -> MomentIO (Sequence t)
-sequenceCommute seqnc = do
+sequenceCommute seqnc = once $ do
     (first, rest) <- runSequence seqnc
     t <- first
     ev <- execute rest
@@ -301,6 +290,15 @@ instance
         let first = firstleft <> firstright
         let ev = unionWith (<>) evleft evright
         pure (first, ev)
+
+-- If t is a Semigroup then SemigroupEvent t is a Monoid, because never can
+-- serve as the identity.
+instance
+    ( Semigroup t
+    ) => Monoid (SemigroupEvent t)
+  where
+    mempty = SemigroupEvent never
+    mappend = (<>)
 
 -- This one overlaps with one from Data.Functor.Compose
 --
