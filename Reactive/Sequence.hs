@@ -73,6 +73,9 @@ newtype Sequence t = Sequence {
       runSequence :: Moment (t, Event t)
     }
 
+getSequence :: MonadMoment m => Sequence t -> m (t, Event t)
+getSequence = liftMoment . runSequence
+
 instance Functor Sequence where
     fmap f = Sequence . fmap f' . runSequence
       where
