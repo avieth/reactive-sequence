@@ -22,7 +22,11 @@ module Reactive.Sequence (
 
       Sequence
     , runSequence
-    , behavior
+    , getSequence
+    , sequenceFirst
+    , sequenceEvent
+    , sequenceBehavior
+    , sequenceChanges
     , revent
     , rstepper
     , (|>)
@@ -112,11 +116,27 @@ revent ev = Compose . Sequence $ pure (Nothing, ev')
   where
     ev' = Just <$> ev
 
-behavior :: MonadMoment m => Sequence t -> m (Behavior t)
-behavior seqnc = liftMoment $ do
+sequenceFirst :: MonadMoment m => Sequence t -> m t
+sequenceFirst seqnc = liftMoment $ do
+    ~(first, _) <- runSequence seqnc
+    pure first
+
+sequenceEvent :: MonadMoment m => Sequence t -> m (Event t)
+sequenceEvent seqnc = liftMoment $ do
+    ~(_, rest) <- runSequence seqnc
+    pure rest
+
+sequenceBehavior :: MonadMoment m => Sequence t -> m (Behavior t)
+sequenceBehavior seqnc = liftMoment $ do
     ~(first, rest) <- runSequence seqnc
     b <- stepper first rest
     pure b
+
+sequenceChanges :: MonadMoment m => Sequence t -> m (Event (t, t))
+sequenceChanges seqnc = liftMoment $ do
+    be <- sequenceBehavior seqnc
+    ev <- sequenceEvent seqnc
+    pure $ (,) <$> be <@> ev
 
 rstepper :: t -> Event t -> Sequence t
 rstepper t ev = Sequence $ pure (t, ev)
