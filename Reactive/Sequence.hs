@@ -112,11 +112,11 @@ revent ev = Compose . Sequence $ pure (Nothing, ev')
   where
     ev' = Just <$> ev
 
-behavior :: Sequence t -> Moment (Behavior t, Event t)
-behavior seqnc = do
+behavior :: MonadMoment m => Sequence t -> m (Behavior t)
+behavior seqnc = liftMoment $ do
     ~(first, rest) <- runSequence seqnc
     b <- stepper first rest
-    pure (b, rest)
+    pure b
 
 rstepper :: t -> Event t -> Sequence t
 rstepper t ev = Sequence $ pure (t, ev)
@@ -140,10 +140,11 @@ withInitial t f = Sequence $ mdo
     pure (t, ev)
 
 sequenceSwitchE
-    :: forall t .
-       Sequence (Event t)
-    -> Moment (Event t)
-sequenceSwitchE seqnc = do
+    :: forall t m .
+       ( MonadMoment m )
+    => Sequence (Event t)
+    -> m (Event t)
+sequenceSwitchE seqnc = liftMoment $ do
     ~(firstEv, restEv) <- runSequence seqnc
     restHasFired :: Behavior Bool <- stepper False (const True <$> restEv)
     let first :: Event t
@@ -156,11 +157,12 @@ sequenceSwitchE seqnc = do
 --   the Sequence is emitted, and its remaining elements follow until the
 --   event fires again.
 sequenceSwitch'
-    :: forall t .
-       Event t
+    :: forall t m .
+       ( MonadMoment m )
+    => Event t
     -> Event (Sequence t)
-    -> Moment (Event t)
-sequenceSwitch' first ev = do
+    -> m (Event t)
+sequenceSwitch' first ev = liftMoment $ do
     secondHasFired :: Behavior Bool <- stepper False (const True <$> ev)
     let controlledFirst :: Event t
         controlledFirst = whenE (not <$> secondHasFired) first
