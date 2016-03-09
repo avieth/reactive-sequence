@@ -13,6 +13,7 @@ Portability : non-portable (GHC only)
 
 import Data.IORef
 import Data.Functor.Identity
+import Data.Functor.Compose
 import Reactive.Banana.Combinators
 import Reactive.Banana.Frameworks
 import Reactive.Sequence
@@ -34,9 +35,12 @@ main = do
             -- We bundle those events, to obtain a new event with the latest
             -- values from all 3 events. It will fire whenever any of them
             -- fires, and all of them have fired at least once.
-            let bundle1 :: SEvent (String, String, String)
-                bundle1 = (,,) <$> ev1 <%> ev2 <%> ev3
+            let bundle1 :: Compose Sequence Maybe (String, String, String)
+                bundle1 = (,,) <$> revent ev1 <*> revent ev2 <*> revent ev3
 
+            let bundle2 = (\(x,y,z) -> (y,z,x)) <$> bundle1
+
+            {-
             let be1 :: SBehavior String
                 be1 = "initial 1" |> ev1
 
@@ -49,15 +53,14 @@ main = do
             -- By adding initial values, we can bundle a behavior.
             let bundle2 :: SBehavior (String, String, String)
                 bundle2 = (,,) <$> be1 <%> be2 <%> be3
+                -}
 
             -- Notice that when we reactimate the SEvent, we can give
             -- const (pure ()) for the first argument, meaning no IO will
             -- happen immediately, as there is no initial value.
-            sequenceReactimate (const (pure (Const ())))
-                               (fmap Identity . runIdentity)
-                               (const ())
-                               (runIdentity)
-                               (print <$> ((,) "Event" <$> bundle1))
+            sequenceReactimate (print <$> ((,) "Event 1" <$> getCompose bundle1))
+            --sequenceReactimate (print <$> ((,) "Event 2" <$> getCompose bundle2))
+            {-
             -- This will fire *many* times before the above reactimate,
             -- for every event of ev1, ev2, or ev3 causes it to run.
             sequenceReactimate (fmap Identity . runIdentity)
@@ -65,6 +68,7 @@ main = do
                                (runIdentity)
                                (runIdentity)
                                (print <$> ((,) "Behavior" <$> bundle2))
+                               -}
 
             liftIO $ writeIORef killThreads [kill1, kill2, kill3]
 

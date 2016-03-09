@@ -16,189 +16,77 @@ Portability : non-portable (GHC only)
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RecursiveDo #-}
+{-# LANGUAGE RankNTypes #-}
 
-module Reactive.Sequence where
+module Reactive.Sequence (
+
+      Sequence
+    , runSequence
+    , behavior
+    , revent
+    , rstepper
+    , (|>)
+    , always
+    , withInitial
+    , sequenceSwitchE
+    , sequenceSwitch
+    , sequenceReactimate
+    , sequenceCommute
+    , LazyApplicative
+    , (~*~)
+    , lazyAp
+    , SemigroupEvent(..)
+    , sequenceAccumulate
+
+    ) where
 
 import Control.Monad.IO.Class
 import Control.Applicative
+import Control.Concurrent.MVar
 import Data.Semigroup
-import Data.IORef
 import Data.Functor.Compose
 import Reactive.Banana.Combinators
 import Reactive.Banana.Frameworks
 import System.IO.Unsafe
-import Debug.Trace
 
-data Once f t where
-    Once :: (IORef (Either (f s) s)) -> (s -> t) -> Once f t
+{-# NOINLINE once #-}
+once :: forall m t . Monad m => m t -> m t
+once uncomputed =
+    let {-# NOINLINE mvar #-}
+        mvar :: MVar (Either (m t) t)
+        mvar = unsafePerformIO $ newMVar (Left uncomputed)
+        {-# NOINLINE check #-}
+        check :: Either (m t) t
+        check = unsafePerformIO $ takeMVar mvar
+        {-# NOINLINE replace #-}
+        replace :: t -> ()
+        replace t = unsafePerformIO (putMVar mvar (Right t))
+    in  case check of
+            Left uncomputed -> do
+                t <- uncomputed
+                pure (replace t `seq` t)
+            Right computed -> pure (replace computed `seq` computed)
 
-instance Functor (Once f) where
-    fmap f (Once ref g) = Once ref (fmap f g)
-
-runOnce :: MonadIO f => Once f t -> f t
-runOnce (Once ioref g) = do
-    x <- liftIO (readIORef ioref)
-    case x of
-        Left uncomputed -> do
-            computed <- uncomputed
-            liftIO $ writeIORef ioref (Right computed)
-            pure (g computed)
-        Right computed -> pure (g computed)
-
-mkOnce :: MonadIO f => f t -> Once f t
-mkOnce uncomputed = unsafePerformIO $ do
-    ref <- liftIO $ newIORef (Left uncomputed)
-    pure (Once ref id)
-
-once :: MonadIO f => f t -> f t
-once = runOnce . mkOnce
-
--- | Use this type to compute applicatively with reactive-banana events.
+-- | A time-varying value of type t: a value and an event giving changes.
+--   Think of it as a formal version of stepper.
 newtype Sequence t = Sequence {
-      getSequence :: MomentIO (t, Event t)
+      runSequence :: Moment (t, Event t)
     }
 
-revent :: Event t -> Compose Sequence Maybe t
-revent ev = Compose . Sequence $ do
-    pure (Nothing, ev')
-  where
-    ev' = Just <$> ev
-
-behavior :: Sequence t -> MomentIO (Behavior t, Event t)
-behavior seqnc = once $ do
-    (first, rest) <- runSequence seqnc
-    b <- stepper first rest
-    pure (b, rest)
-
-rstepper :: t -> Event t -> Sequence t
-rstepper t ev = Sequence $ pure (t, ev)
-
-(|>) :: t -> Event t -> Sequence t
-(|>) = rstepper
-
-rstepper' :: t -> Sequence t -> Sequence t
-rstepper' t seq = Sequence . once $ do
-    (_, ev) <- runSequence seq
-    pure (t, ev)
-
-(|~) :: t -> Sequence t -> Sequence t
-(|~) = rstepper'
-
-always :: t -> Sequence t
-always t = Sequence $ pure (t, never)
-
--- | Get the sequence lagged one frame.
-lag :: Sequence t -> Sequence t
-lag seqnc = Sequence . once $ do
-    (lagged, fire) <- newEvent
-    (t, ev) <- runSequence seqnc
-    reactimate (fire <$> ev)
-    pure (t, lagged)
-
--- | Use this to make recursively-defined Sequences. You'll almost certainly
---   use ~*~ in the function.
-withInitial :: t -> (Sequence t -> Sequence t) -> Sequence t
-withInitial t f = Sequence . once $ mdo
-    let b = rstepper t ev
-    let e = f b
-    (_, ev) <- runSequence e
-    pure (t, ev)
-
-runSequence :: Sequence t -> MomentIO (t, Event t)
-runSequence = getSequence
-
--- | Switch between Sequences. Whenever the event fires, the first element of
---   the Sequence is emitted, and its remaining elements follow until the
---   event fires again.
-sequenceSwitch' :: forall t . Event t -> Event (Sequence t) -> MomentIO (Event t)
-sequenceSwitch' first ev = once $ do
-    secondHasFired :: Behavior Bool <- stepper False (const True <$> ev)
-    let controlledFirst :: Event t
-        controlledFirst = whenE (not <$> secondHasFired) first
-    executed :: Event (t, Event t) <- execute (runSequence <$> ev)
-    {-
-    let firsts :: Event t
-        firsts = unionWith const (fst <$> executed) controlledFirst 
-    let rests :: Event t
-        rests = switchE (snd <$> executed)
-    pure (unionWith const firsts rests)
-    -}
-    let bundle :: forall t . Event (t, Event t) -> Event t
-        bundle ev = unionWith const (switchE (snd <$> ev)) (fst <$> ev)
-    let bundled :: Event t
-        bundled = bundle executed
-    pure (unionWith const bundled controlledFirst)
-
--- | This is like sequenceSwitch' but we have to account for the initial
---   sequence. How?! How to determine when to ditch the initial sequence's
---   event? Could make a new event... seems sloppy though.
---   If we can get two Event (Sequence t)s then we're golden.
---
---   Must be very careful about the semantics here.
---   Whenever the sequence changes, the output sequence assumes its sequence.
---   We could do this by making a new event, but I'd rather it be immediate.
---
---
-sequenceSwitch :: forall t . Sequence (Sequence t) -> Sequence t
-sequenceSwitch seqnc = Sequence . once $ do
-    -- laterSequences is in control. Whenever it fires, we want to put out
-    -- its first element and switch to its event.
-    -- Ultimately what we must do is come up with an Event (Event t).
-    -- We will need the Event from the firstSequence to be one of these, but
-    -- I don't believe reactive-banana provides a canonical way to do this.
-    -- Ok, we can create a new event and fire it right away.
-    (firstSequence :: Sequence t, laterSequences :: Event (Sequence t))
-        <- runSequence seqnc
-    (first :: t, firstRest :: Event t) <- runSequence firstSequence
-    switched :: Event t <- sequenceSwitch' firstRest laterSequences
-    pure (first, switched)
-
-sequenceSwitchE :: forall t . Sequence (Event t) -> MomentIO (Event t)
-sequenceSwitchE seqnc = do
-    (firstEv, restEv) <- runSequence seqnc
-    restHasFired :: Behavior Bool <- stepper False (const True <$> restEv)
-    let first :: Event t
-        first = whenE (not <$> restHasFired) firstEv
-    let rest :: Event t
-        rest = switchE restEv
-    pure (unionWith const rest first)
-
-sequenceReactimate :: Sequence (IO ()) -> MomentIO ()
-sequenceReactimate seqnc = do
-    (first, rest) <- runSequence seqnc
-    liftIO first
-    reactimate rest
-
-sequenceCommute :: Sequence (MomentIO t) -> MomentIO (Sequence t)
-sequenceCommute seqnc = once $ do
-    (first, rest) <- runSequence seqnc
-    t <- first
-    ev <- execute rest
-    pure (rstepper t ev)
-
--- | Like sequenceCommute, but it's performed when the Sequence is forced.
---   TBD useful at all? Seems simply to not work when you expect it to.
-sequenceAbsorb :: Sequence (MomentIO t) -> Sequence t
-sequenceAbsorb seqnc = Sequence $ do
-    (first, rest) <- runSequence seqnc
-    t <- first
-    ev <- execute rest
-    pure (t, ev)
-
 instance Functor Sequence where
-    fmap f = Sequence . fmap f' . getSequence
+    fmap f = Sequence . fmap f' . runSequence
       where
-        f' ~(t, ev) = (f t, fmap f ev)
+        f' (t, ev) = (f t, fmap f ev)
 
 instance Applicative Sequence where
     pure x = Sequence $ pure (x, never)
     (mf :: Sequence (s -> t)) <*> (mx :: Sequence s) = Sequence . once $ do
-        (firstf, evf) <- getSequence $ mf
-        (firstx, evx) <- getSequence $ mx
+        ~(firstf, evf) <- runSequence mf
+        ~(firstx, evx) <- runSequence mx
         combined <- combineIt (firstf, evf) (firstx, evx)
         pure (firstf firstx, combined)
       where
-        combineIt (firstf, evf) (firstx, evx) = do
+        combineIt ~(firstf, evf) ~(firstx, evx) = do
             bef <- stepper firstf evf
             bex <- stepper firstx evx
             let xchange :: Event (s -> t, s)
@@ -215,6 +103,104 @@ instance Applicative Sequence where
             let applied :: Event t
                 applied = fmap (uncurry ($)) unioned
             pure applied
+
+revent :: Event t -> Compose Sequence Maybe t
+revent ev = Compose . Sequence $ pure (Nothing, ev')
+  where
+    ev' = Just <$> ev
+
+behavior :: Sequence t -> Moment (Behavior t, Event t)
+behavior seqnc = do
+    ~(first, rest) <- runSequence seqnc
+    b <- stepper first rest
+    pure (b, rest)
+
+rstepper :: t -> Event t -> Sequence t
+rstepper t ev = Sequence $ pure (t, ev)
+
+(|>) :: t -> Event t -> Sequence t
+(|>) = rstepper
+
+always :: t -> Sequence t
+always t = Sequence $ pure (t, never)
+
+-- | Use this to make recursively-defined Sequences. You'll almost certainly
+--   use ~*~ in the function.
+withInitial
+    :: t
+    -> (Sequence t -> Sequence t)
+    -> Sequence t
+withInitial t f = Sequence $ mdo
+    let b = rstepper t ev
+    let e = f b
+    ~(_, ev) <- runSequence e
+    pure (t, ev)
+
+sequenceSwitchE
+    :: forall t .
+       Sequence (Event t)
+    -> Moment (Event t)
+sequenceSwitchE seqnc = do
+    ~(firstEv, restEv) <- runSequence seqnc
+    restHasFired :: Behavior Bool <- stepper False (const True <$> restEv)
+    let first :: Event t
+        first = whenE (not <$> restHasFired) firstEv
+    let rest :: Event t
+        rest = switchE restEv
+    pure (unionWith const rest first)
+
+-- | Switch between Sequences. Whenever the event fires, the first element of
+--   the Sequence is emitted, and its remaining elements follow until the
+--   event fires again.
+sequenceSwitch'
+    :: forall t .
+       Event t
+    -> Event (Sequence t)
+    -> Moment (Event t)
+sequenceSwitch' first ev = do
+    secondHasFired :: Behavior Bool <- stepper False (const True <$> ev)
+    let controlledFirst :: Event t
+        controlledFirst = whenE (not <$> secondHasFired) first
+    let observed :: Event (t, Event t)
+        observed = observeE (runSequence <$> ev)
+    let bundle :: forall t . Event (t, Event t) -> Event t
+        bundle ev = unionWith const (switchE (snd <$> ev)) (fst <$> ev)
+    let bundled :: Event t
+        bundled = bundle observed
+    pure (unionWith const bundled controlledFirst)
+
+-- | This is like sequenceSwitch' but we have to account for the initial
+--   sequence. How?! How to determine when to ditch the initial sequence's
+--   event? Could make a new event... seems sloppy though.
+--   If we can get two Event (Sequence t)s then we're golden.
+--
+--   Must be very careful about the semantics here.
+--   Whenever the sequence changes, the output sequence assumes its sequence.
+--   We could do this by making a new event, but I'd rather it be immediate.
+sequenceSwitch
+    :: forall t .
+       Sequence (Sequence t)
+    -> Sequence t
+sequenceSwitch seqnc = Sequence . once $ do
+    (firstSequence :: Sequence t, laterSequences :: Event (Sequence t))
+        <- runSequence seqnc
+    (first :: t, firstRest :: Event t) <- runSequence firstSequence
+    switched :: Event t <- sequenceSwitch' firstRest laterSequences
+    pure (first, switched)
+
+sequenceReactimate :: Sequence (IO ()) -> MomentIO ()
+sequenceReactimate seqnc = do
+    (first, rest) <- liftMoment (runSequence seqnc)
+    liftIO first
+    reactimate rest
+
+sequenceCommute :: Sequence (MomentIO t) -> MomentIO (Sequence t)
+sequenceCommute seqnc = do
+    (first, rest) <- liftMoment (runSequence seqnc)
+    t <- first
+    ev <- execute rest
+    pure (rstepper t ev)
+
 
 {-
    Recursion in reactive-banana comes up all the time. The example from the
@@ -258,9 +244,8 @@ infixl 4 ~*~
 
 instance LazyApplicative Sequence where
     lazyAp mf mx = Sequence . once $ do
-        (firstf, evf) <- getSequence $ mf
-        (firstx, evx) <- getSequence $ mx
-        bef <- stepper firstf evf
+        ~(firstf, evf) <- runSequence mf
+        ~(firstx, evx) <- runSequence mx
         bex <- stepper firstx evx
         let applied = (\x f -> f x) <$> bex <@> evf
         pure (firstf firstx, applied)
@@ -285,8 +270,8 @@ instance
     ) => Semigroup (Sequence t)
   where
     left <> right = Sequence . once $ do
-        (firstleft, evleft) <- getSequence left
-        (firstright, evright) <- getSequence right
+        ~(firstleft, evleft) <- runSequence left
+        ~(firstright, evright) <- runSequence right
         let first = firstleft <> firstright
         let ev = unionWith (<>) evleft evright
         pure (first, ev)
@@ -306,11 +291,26 @@ instance
 --
 -- but since Sequence is not and never will be an Alternative, that instance
 -- can never match.
-instance {-# OVERLAPS #-} Alternative f => Alternative (Compose Sequence f) where
+instance {-# OVERLAPS #-}
+    ( Alternative f
+    ) => Alternative (Compose Sequence f)
+  where
     empty = Compose (pure empty)
     (Compose (left :: Sequence (f t))) <|> (Compose (right :: Sequence (f t))) = Compose . Sequence . once $ do
-        (firstleft, evleft) <- getSequence $ left
-        (firstright, evright) <- getSequence $ right
+        ~(firstleft, evleft) <- runSequence left
+        ~(firstright, evright) <- runSequence right
         let first = firstleft <|> firstright
         let ev = unionWith (<|>) evleft evright
         pure (first, ev)
+
+-- | Given a first value, an event with changes, and a way to combine them,
+--   get a Sequence with the latest value. It changes whenever the event
+--   changes.
+sequenceAccumulate
+    :: (b -> a -> a)
+    -> (a, Event b)
+    -> Sequence a
+sequenceAccumulate f (a, ev) = Sequence . once $ mdo
+    let changes = flip f <$> be <@> ev
+    be <- stepper a changes
+    pure (a, changes)

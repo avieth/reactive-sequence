@@ -18,11 +18,11 @@ import Reactive.Banana.Combinators
 import Reactive.Banana.Frameworks
 import Reactive.Sequence
 
-timedEvent :: Int -> IO t -> MomentIO (SEvent t, IO ())
+timedEvent :: Int -> IO t -> MomentIO (Event t, IO ())
 timedEvent timeout mk = do
     (ev, fire) <- newEvent
     threadId <- liftIO $ forkIO (fireRepeatedly timeout mk fire)
-    pure (eventToSEvent ev, killThread threadId)
+    pure (ev, killThread threadId)
   where
     fireRepeatedly timeout mk fire = do
         threadDelay timeout
