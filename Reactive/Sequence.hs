@@ -20,7 +20,8 @@ Portability : non-portable (GHC only)
 
 module Reactive.Sequence (
 
-      Sequence
+      SemigroupEvent(..)
+    , Sequence
     , runSequence
     , getSequence
     , sequenceFirst
@@ -31,16 +32,14 @@ module Reactive.Sequence (
     , rstepper
     , (|>)
     , always
-    , withInitial
     , sequenceSwitchE
     , sequenceSwitch
+    , sequenceAccumulate
     , sequenceReactimate
     , sequenceCommute
     , LazyApplicative
     , (~*~)
     , lazyAp
-    , SemigroupEvent(..)
-    , sequenceAccumulate
 
     ) where
 
@@ -77,6 +76,7 @@ newtype Sequence t = Sequence {
       runSequence :: Moment (t, Event t)
     }
 
+-- | Like runSequence but in an arbitrary MonadMoment, for convenience.
 getSequence :: MonadMoment m => Sequence t -> m (t, Event t)
 getSequence = liftMoment . runSequence
 
@@ -111,54 +111,54 @@ instance Applicative Sequence where
                 applied = fmap (uncurry ($)) unioned
             pure applied
 
+-- | Make a Sequence from an Event, by giving Nothing for the initial value.
 revent :: Event t -> Compose Sequence Maybe t
 revent ev = Compose . Sequence $ pure (Nothing, ev')
   where
     ev' = Just <$> ev
 
+-- | Get the initial value of a Sequence.
 sequenceFirst :: MonadMoment m => Sequence t -> m t
 sequenceFirst seqnc = liftMoment $ do
     ~(first, _) <- runSequence seqnc
     pure first
 
+-- | Get the changes to a Sequence.
 sequenceEvent :: MonadMoment m => Sequence t -> m (Event t)
 sequenceEvent seqnc = liftMoment $ do
     ~(_, rest) <- runSequence seqnc
     pure rest
 
+-- | Derive a Behavior from a Sequence.
 sequenceBehavior :: MonadMoment m => Sequence t -> m (Behavior t)
 sequenceBehavior seqnc = liftMoment $ do
     ~(first, rest) <- runSequence seqnc
     b <- stepper first rest
     pure b
 
+-- | Derive an Event which fires whenever the Sequence changes, pairing the
+--   new value (snd) with the previous value (fst).
 sequenceChanges :: MonadMoment m => Sequence t -> m (Event (t, t))
 sequenceChanges seqnc = liftMoment $ do
     be <- sequenceBehavior seqnc
     ev <- sequenceEvent seqnc
     pure $ (,) <$> be <@> ev
 
+-- | Construct a Sequence by giving an initia value and its changes.
+--   Compare at @stepper :: MonadMoment m => t -> Event t -> m (Behavior t)@
 rstepper :: t -> Event t -> Sequence t
 rstepper t ev = Sequence $ pure (t, ev)
 
 (|>) :: t -> Event t -> Sequence t
 (|>) = rstepper
 
+-- | A Sequence which never changes. This is @pure@ in the Sequence Applicative
+--   instance.
 always :: t -> Sequence t
 always t = Sequence $ pure (t, never)
 
--- | Use this to make recursively-defined Sequences. You'll almost certainly
---   use ~*~ in the function.
-withInitial
-    :: t
-    -> (Sequence t -> Sequence t)
-    -> Sequence t
-withInitial t f = Sequence $ mdo
-    let b = rstepper t ev
-    let e = f b
-    ~(_, ev) <- runSequence e
-    pure (t, ev)
-
+-- | Switch a Sequence of Events. The derived Event fires when the latest Event
+--   to come from the Sequence fires.
 sequenceSwitchE
     :: forall t m .
        ( MonadMoment m )
@@ -173,9 +173,6 @@ sequenceSwitchE seqnc = liftMoment $ do
         rest = switchE restEv
     pure (unionWith const rest first)
 
--- | Switch between Sequences. Whenever the event fires, the first element of
---   the Sequence is emitted, and its remaining elements follow until the
---   event fires again.
 sequenceSwitch'
     :: forall t m .
        ( MonadMoment m )
@@ -194,14 +191,9 @@ sequenceSwitch' first ev = liftMoment $ do
         bundled = bundle observed
     pure (unionWith const bundled controlledFirst)
 
--- | This is like sequenceSwitch' but we have to account for the initial
---   sequence. How?! How to determine when to ditch the initial sequence's
---   event? Could make a new event... seems sloppy though.
---   If we can get two Event (Sequence t)s then we're golden.
---
---   Must be very careful about the semantics here.
---   Whenever the sequence changes, the output sequence assumes its sequence.
---   We could do this by making a new event, but I'd rather it be immediate.
+-- | Switch between Sequences. Whenever the event fires, the first element of
+--   the Sequence is emitted, and its remaining elements follow until the
+--   event fires again.
 sequenceSwitch
     :: forall t .
        Sequence (Sequence t)
@@ -213,50 +205,35 @@ sequenceSwitch seqnc = Sequence . once $ do
     switched :: Event t <- sequenceSwitch' firstRest laterSequences
     pure (first, switched)
 
+-- | Given a first value, an event with changes, and a way to combine them,
+--   get a Sequence with the latest value. It changes whenever the event
+--   changes.
+sequenceAccumulate
+    :: (b -> a -> a)
+    -> a
+    -> Event b
+    -> Sequence a
+sequenceAccumulate f a ev = Sequence . once $ mdo
+    let changes = flip f <$> be <@> ev
+    be <- stepper a changes
+    pure (a, changes)
+
+-- | Run an IO whenever the Sequence produces a new one. The initial one is
+--   run immediately.
 sequenceReactimate :: Sequence (IO ()) -> MomentIO ()
 sequenceReactimate seqnc = do
     (first, rest) <- liftMoment (runSequence seqnc)
     liftIO first
     reactimate rest
 
+-- | Like execute :: Event (MomentIO t) -> MomentIO (Event t).
+--   The initial MomentIO is run immediately.
 sequenceCommute :: Sequence (MomentIO t) -> MomentIO (Sequence t)
 sequenceCommute seqnc = do
     (first, rest) <- liftMoment (runSequence seqnc)
     t <- first
     ev <- execute rest
     pure (rstepper t ev)
-
-
-{-
-   Recursion in reactive-banana comes up all the time. The example from the
-   Hackage docs:
-
-     let e2 = (\a f -> f a) <$> b <@> e1
-     b <- stepper a e2
-     return e2
-
-   The applicative instance for Sequence can't be used in this way, because
-   it uses the events of both arguments. If we write
-
-     let e2 = (\a f -> f a) <$> b <*> e1
-     let b = rstepper a e2
-     runSequence e2
-
-   then we have a useless value: the event in b fires whenever the event in
-   e2 fires, which in turn fires whenever the event in e1 *or the event in b*
-   fires. We've created a cycle.
-
-   The right way to express this is so:
-
-     let e2 = e1 ~%~ b
-     let b = rstepper a e2
-     runSequence e2
-
-   The combinator ~%~, an alias for lazyAp, is just like <*> except that its
-   second parameter's event is used only to come up with a stepper. The
-   resulting Sequence's event does not fire when its second argument's
-   event fires.
--}
 
 class LazyApplicative f where
     -- | A lazy variant of <*>, which uses the events of the RHS only as an argument
@@ -278,6 +255,8 @@ instance LazyApplicative Sequence where
 instance Applicative f => LazyApplicative (Compose Sequence f) where
     lazyAp mf mx = Compose $ (<*>) <$> getCompose mf ~*~ getCompose mx
 
+-- | If an Event carries a Semigroup, then it's a Monoid: never is the
+--   identity, and unionWith (<>) combines two values.
 newtype SemigroupEvent t = SemigroupEvent {
       runSemigroupEvent :: Event t
     }
@@ -301,8 +280,6 @@ instance
         let ev = unionWith (<>) evleft evright
         pure (first, ev)
 
--- If t is a Semigroup then SemigroupEvent t is a Monoid, because never can
--- serve as the identity.
 instance
     ( Semigroup t
     ) => Monoid (SemigroupEvent t)
@@ -327,15 +304,3 @@ instance {-# OVERLAPS #-}
         let first = firstleft <|> firstright
         let ev = unionWith (<|>) evleft evright
         pure (first, ev)
-
--- | Given a first value, an event with changes, and a way to combine them,
---   get a Sequence with the latest value. It changes whenever the event
---   changes.
-sequenceAccumulate
-    :: (b -> a -> a)
-    -> (a, Event b)
-    -> Sequence a
-sequenceAccumulate f (a, ev) = Sequence . once $ mdo
-    let changes = flip f <$> be <@> ev
-    be <- stepper a changes
-    pure (a, changes)
