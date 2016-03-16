@@ -52,24 +52,6 @@ import Reactive.Banana.Combinators
 import Reactive.Banana.Frameworks
 import System.IO.Unsafe
 
-{-# NOINLINE once #-}
-once :: forall m t . Monad m => m t -> m t
-once uncomputed =
-    let {-# NOINLINE mvar #-}
-        mvar :: MVar (Either (m t) t)
-        mvar = unsafePerformIO $ newMVar (Left uncomputed)
-        {-# NOINLINE check #-}
-        check :: Either (m t) t
-        check = unsafePerformIO $ takeMVar mvar
-        {-# NOINLINE replace #-}
-        replace :: t -> ()
-        replace t = unsafePerformIO (putMVar mvar (Right t))
-    in  case check of
-            Left uncomputed -> do
-                t <- uncomputed
-                pure (replace t `seq` t)
-            Right computed -> pure (replace computed `seq` computed)
-
 -- | A time-varying value of type t: a value and an event giving changes.
 --   Think of it as a formal version of stepper.
 newtype Sequence t = Sequence {
@@ -78,16 +60,16 @@ newtype Sequence t = Sequence {
 
 -- | Like runSequence but in an arbitrary MonadMoment, for convenience.
 getSequence :: MonadMoment m => Sequence t -> m (t, Event t)
-getSequence = liftMoment . runSequence
+getSequence ~(Sequence m) = liftMoment m
 
 instance Functor Sequence where
     fmap f = Sequence . fmap f' . runSequence
       where
-        f' (t, ev) = (f t, fmap f ev)
+        f' ~(t, ev) = (f t, fmap f ev)
 
 instance Applicative Sequence where
     pure x = Sequence $ pure (x, never)
-    (mf :: Sequence (s -> t)) <*> (mx :: Sequence s) = Sequence . once $ do
+    (mf :: Sequence (s -> t)) <*> (mx :: Sequence s) = Sequence $ do
         ~(firstf, evf) <- runSequence mf
         ~(firstx, evx) <- runSequence mx
         combined <- combineIt (firstf, evf) (firstx, evx)
@@ -119,8 +101,8 @@ revent ev = Compose . Sequence $ pure (Nothing, ev')
 
 -- | Get the initial value of a Sequence.
 sequenceFirst :: MonadMoment m => Sequence t -> m t
-sequenceFirst seqnc = liftMoment $ do
-    ~(first, _) <- runSequence seqnc
+sequenceFirst seqnc = do
+    ~(first, _) <- getSequence seqnc
     pure first
 
 -- | Get the changes to a Sequence.
@@ -131,15 +113,15 @@ sequenceEvent seqnc = liftMoment $ do
 
 -- | Derive a Behavior from a Sequence.
 sequenceBehavior :: MonadMoment m => Sequence t -> m (Behavior t)
-sequenceBehavior seqnc = liftMoment $ do
-    ~(first, rest) <- runSequence seqnc
+sequenceBehavior seqnc = do
+    ~(first, rest) <- getSequence seqnc
     b <- stepper first rest
     pure b
 
 -- | Derive an Event which fires whenever the Sequence changes, pairing the
 --   new value (snd) with the previous value (fst).
 sequenceChanges :: MonadMoment m => Sequence t -> m (Event (t, t))
-sequenceChanges seqnc = liftMoment $ do
+sequenceChanges seqnc = do
     be <- sequenceBehavior seqnc
     ev <- sequenceEvent seqnc
     pure $ (,) <$> be <@> ev
@@ -164,8 +146,8 @@ sequenceSwitchE
        ( MonadMoment m )
     => Sequence (Event t)
     -> m (Event t)
-sequenceSwitchE seqnc = liftMoment $ do
-    ~(firstEv, restEv) <- runSequence seqnc
+sequenceSwitchE seqnc = do
+    ~(firstEv, restEv) <- getSequence seqnc
     restHasFired :: Behavior Bool <- stepper False (const True <$> restEv)
     let first :: Event t
         first = whenE (not <$> restHasFired) firstEv
@@ -198,10 +180,10 @@ sequenceSwitch
     :: forall t .
        Sequence (Sequence t)
     -> Sequence t
-sequenceSwitch seqnc = Sequence . once $ do
-    (firstSequence :: Sequence t, laterSequences :: Event (Sequence t))
+sequenceSwitch seqnc = Sequence $ do
+    ~(firstSequence :: Sequence t, laterSequences :: Event (Sequence t))
         <- runSequence seqnc
-    (first :: t, firstRest :: Event t) <- runSequence firstSequence
+    ~(first :: t, firstRest :: Event t) <- runSequence firstSequence
     switched :: Event t <- sequenceSwitch' firstRest laterSequences
     pure (first, switched)
 
@@ -213,7 +195,8 @@ sequenceAccumulate
     -> a
     -> Event b
     -> Sequence a
-sequenceAccumulate f a ev = Sequence . once $ mdo
+sequenceAccumulate f a ev = Sequence $ mdo
+    -- Using Sequence . once causes divergence in some cases. Not sure why.
     let changes = flip f <$> be <@> ev
     be <- stepper a changes
     pure (a, changes)
@@ -245,7 +228,7 @@ infixl 4 ~*~
 (~*~) = lazyAp
 
 instance LazyApplicative Sequence where
-    lazyAp mf mx = Sequence . once $ do
+    lazyAp mf mx = Sequence $ do
         ~(firstf, evf) <- runSequence mf
         ~(firstx, evx) <- runSequence mx
         bex <- stepper firstx evx
@@ -271,21 +254,21 @@ instance
 
 instance
     ( Semigroup t
+    ) => Monoid (SemigroupEvent t)
+  where
+    mempty = SemigroupEvent never
+    mappend = (<>)
+
+instance
+    ( Semigroup t
     ) => Semigroup (Sequence t)
   where
-    left <> right = Sequence . once $ do
+    left <> right = Sequence $ do
         ~(firstleft, evleft) <- runSequence left
         ~(firstright, evright) <- runSequence right
         let first = firstleft <> firstright
         let ev = unionWith (<>) evleft evright
         pure (first, ev)
-
-instance
-    ( Semigroup t
-    ) => Monoid (SemigroupEvent t)
-  where
-    mempty = SemigroupEvent never
-    mappend = (<>)
 
 -- This one overlaps with one from Data.Functor.Compose
 --
@@ -298,7 +281,7 @@ instance {-# OVERLAPS #-}
     ) => Alternative (Compose Sequence f)
   where
     empty = Compose (pure empty)
-    (Compose (left :: Sequence (f t))) <|> (Compose (right :: Sequence (f t))) = Compose . Sequence . once $ do
+    (Compose (left :: Sequence (f t))) <|> (Compose (right :: Sequence (f t))) = Compose . Sequence $ do
         ~(firstleft, evleft) <- runSequence left
         ~(firstright, evright) <- runSequence right
         let first = firstleft <|> firstright
