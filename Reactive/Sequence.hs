@@ -21,6 +21,12 @@ Portability : non-portable (GHC only)
 module Reactive.Sequence (
 
       SemigroupEvent(..)
+    , Eventually(..)
+    , getEventually
+    , eventually
+    , immediately
+    , delayed
+    , toSequence
     , Sequence
     , runSequence
     , getSequence
@@ -51,6 +57,27 @@ import Data.Functor.Compose
 import Reactive.Banana.Combinators
 import Reactive.Banana.Frameworks
 import System.IO.Unsafe
+
+newtype Eventually t = Eventually {
+      getEventually :: Either t (Event t)
+    }
+
+instance Functor Eventually where
+    fmap f (Eventually choice) = Eventually $ case choice of
+        Left t -> Left (f t)
+        Right e -> Right (f <$> e)
+
+eventually :: (t -> r) -> (Event t -> r) -> Eventually t -> r
+eventually l r = either l r . getEventually
+
+immediately :: t -> Eventually t
+immediately = Eventually . Left
+
+delayed :: Event t -> Eventually t
+delayed = Eventually . Right
+
+toSequence :: Monoid t => Eventually t -> Sequence t
+toSequence = eventually always (\e -> mempty |> e)
 
 -- | A time-varying value of type t: a value and an event giving changes.
 --   Think of it as a formal version of stepper.
@@ -151,26 +178,68 @@ sequenceSwitchE seqnc = do
     restHasFired :: Behavior Bool <- stepper False (const True <$> restEv)
     let first :: Event t
         first = whenE (not <$> restHasFired) firstEv
-    let rest :: Event t
-        rest = switchE restEv
+    rest :: Event t
+        <- switchE restEv
     pure (unionWith const rest first)
 
-sequenceSwitch'
+{-
+sequenceSwitchE'
     :: forall t m .
        ( MonadMoment m )
-    => Event t
-    -> Event (Sequence t)
+    => Event (Sequence t)
     -> m (Event t)
-sequenceSwitch' first ev = liftMoment $ do
+sequenceSwitchE' ev = do
+    let observed :: Event (t, Event t)
+        observed = observeE (runSequence <$> ev)
+    -- We have here two sources of events: those which come from the initial
+    -- parts, and those which come from the event parts.
+    let initialParts :: Event t
+        initialParts = fst <$> observed
+    let eventParts :: Event (Event t)
+        eventParts = snd <$> observed
+    -- Whenever a new initial part is heard, we want to stop whatever event
+    -- is currently in focus, and shift over to the event associated with that
+    -- initial part.
+    -- If we switchE the events parts, then we lose the ability to distinguish
+    -- between events belonging to different initial parts. We need the outer
+    -- event.
+    -- To sort this all out we use the notion of an alternator; two of them, in
+    -- fact. When they are equal, we let the switched event parts through, but
+    -- a firing of initial will flip the initial alternator, making them not
+    -- equal. While they're not equal, a firing of eventParts will flip the
+    -- event alternator, making them equal again.
+    -- eventParts ought never to fire twice without initialParts firing in
+    -- between. by construction of Sequence.
+    let switched = switchE eventParts
+    alternatorInitial :: Behavior Bool
+        <- stepper True alternateInitial
+    let alternateInitial :: Event Bool
+        alternateInitial = not <$> alternateInitial (alternatorEvent <@ initialParts)
+    alternatorEvent :: Behavior Bool
+        <- stepper True alternateEvent
+    let alternateEvent :: Event Bool
+        alternateEvent = not <$> alternateEvent <@> eventParts
+
+    pure (whenE sync switched)
+-}
+
+sequenceSwitch'
+    :: forall t .
+       Event t
+    -> Event (Sequence t)
+    -> Moment (Event t)
+sequenceSwitch' first ev = do
     secondHasFired :: Behavior Bool <- stepper False (const True <$> ev)
     let controlledFirst :: Event t
         controlledFirst = whenE (not <$> secondHasFired) first
     let observed :: Event (t, Event t)
         observed = observeE (runSequence <$> ev)
-    let bundle :: forall t . Event (t, Event t) -> Event t
-        bundle ev = unionWith const (switchE (snd <$> ev)) (fst <$> ev)
-    let bundled :: Event t
-        bundled = bundle observed
+    let bundle :: forall t . Event (t, Event t) -> Moment (Event t)
+        bundle ev = do
+            switched <- switchE (snd <$> ev)
+            pure (unionWith const switched (fst <$> ev))
+    bundled :: Event t
+        <- bundle observed
     pure (unionWith const bundled controlledFirst)
 
 -- | Switch between Sequences. Whenever the event fires, the first element of
